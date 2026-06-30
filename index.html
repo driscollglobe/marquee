@@ -670,7 +670,7 @@ function pushLog(st, events) {
   result += '.';
   ev.push(result);
 
-  st.log.unshift({ label:`Q${st.quarter}'${String(st.year).slice(2)}`, html:ev.join(' ') });
+  st.log.unshift({ label:`Q${st.quarter}'${String(st.year).slice(2)}`, html:ev.join(' '), next:ins.next });
   if (st.log.length > 8) st.log.pop();
 }
 
@@ -872,7 +872,7 @@ window.MarqueWorld = (() => {
 'use strict';
 
 // ── grid + catalog ───────────────────────────────────────────────────────────
-const GRID_W = 9, GRID_D = 7;       // tiles
+const GRID_W = 14, GRID_D = 10;     // tiles — roomy campus that sprawls over the years
 const BASE_CAPACITY = 60;           // k units/q with no plants (a starter line)
 
 const CATALOG = {
@@ -905,6 +905,26 @@ const CATALOG = {
       null,
       { placeCost:180, h:0.85 },   // L1 — +30M/q Powertrain R&D equivalent
       { upgradeCost:160, h:1.25 }, // L2 — +60M/q Powertrain R&D equivalent
+    ],
+  },
+  // Test Track — adds Eng R&D equivalent each quarter (perf boost + recall risk
+  // reduction via quality). L2 amplifies the coupe halo (noted in shell).
+  testtrack: {
+    type:'testtrack', name:'Test Track', w:4, d:2, maxLevel:2, color:'#C87941',
+    levels: [
+      null,
+      { placeCost:160, h:0.55 },   // L1 — +25M/q Eng R&D equivalent
+      { upgradeCost:140, h:0.65 }, // L2 — +50M/q; coupe halo amplified in shell
+    ],
+  },
+  // Quality Center — boosts Reliability R&D each quarter; presence enables a
+  // per-recall warranty cash offset applied by the shell post-advance.
+  qualitycenter: {
+    type:'qualitycenter', name:'Quality Center', w:2, d:2, maxLevel:2, color:'#4E9A6E',
+    levels: [
+      null,
+      { placeCost:140, h:0.7 },    // L1 — +25M/q Reliability R&D; $15M recall warranty
+      { upgradeCost:130, h:1.0 },  // L2 — +50M/q; $30M recall warranty
     ],
   },
 };
@@ -949,18 +969,25 @@ function capacityOf(o){
 function deriveCampusInputs(campus){
   let capacity = BASE_CAPACITY;
   let studioPresent = false, studioLevel = 0;
+  let testTrackLevel = 0, qcLevel = 0;
   const rdBonuses = { eng:0, eff:0, mfg:0 };
   campus.objects.forEach(o => {
     capacity += capacityOf(o);
-    if(o.type==='studio'){ studioPresent = true; if(o.level>studioLevel) studioLevel = o.level; }
+    if(o.type==='studio'){     studioPresent = true; if(o.level>studioLevel) studioLevel = o.level; }
     if(o.type==='rdlab'){
       const bonus = (o.level >= 2 ? 60 : 30);
       const focus = o.labFocus || 'eng';
       rdBonuses[focus] = (rdBonuses[focus]||0) + bonus;
     }
+    if(o.type==='testtrack')    testTrackLevel = Math.max(testTrackLevel, o.level);
+    if(o.type==='qualitycenter') qcLevel        = Math.max(qcLevel, o.level);
   });
+  if(testTrackLevel > 0) rdBonuses.eng = (rdBonuses.eng||0) + (testTrackLevel >= 2 ? 50 : 25);
+  if(qcLevel > 0)        rdBonuses.eff = (rdBonuses.eff||0) + (qcLevel >= 2 ? 50 : 25);
   return { capacity, designStudio:{ present:studioPresent, level:studioLevel },
-           rdBonuses, segmentUnlocks:[], brandBonus:0, manufacturingBonus:0 };
+           rdBonuses, testTrackLevel,
+           qualityCenter:{ level:qcLevel, warrantyCash: qcLevel>=2 ? 30 : qcLevel>=1 ? 15 : 0 },
+           segmentUnlocks:[], brandBonus:0, manufacturingBonus:0 };
 }
 
 // mutating ops — pure over (campus, cash). cashSpentOnCampus is a campus-local
@@ -1022,8 +1049,15 @@ let wT = 0, rafId = 0;
 let factorySimState = null;
 const BS_COLORS_WORLD = { sedan:'#E8584B', suv:'#3F8EE0', pickup:'#46B97A', coupe:'#8E6BD8' };
 
-// ── ambient campus agents (workers + forklift) ───────────────────────────────
+// post-advance production burst: counts down for 2.5s after triggerBurst()
+let burstT = 0;
+
+// ── ambient campus agents (workers + forklift + finished cars) ────────────────
+// Density and motion scale with real sim output (units built, utilization): a
+// booming quarter teems with workers, forklifts, and cars rolling out; a capped
+// or failing one looks sparse. Presentation only — never touches sim state.
 let agents = [], agentCampusStamp = -1;
+let cars = [], carSpawnT = 0;
 
 // ── iso projection (with user pan + zoom) ────────────────────────────────────
 const TW=46, TH=23, ZS=20;
@@ -1040,12 +1074,22 @@ function resize(){
   ctx.setTransform(DPR,0,0,DPR,0,0);
 }
 function fit(){
-  view.sc = Math.max(0.55, Math.min(W/620, H/360, 1.5));
-  view.ox = W*0.5;
+  // Frame the whole iso grid. In screen space, (x-y) spans [-GRID_D, GRID_W] and
+  // (x+y) spans [0, GRID_W+GRID_D]; compute the scale that fits both with margins,
+  // then centre the grid's midpoint, so framing stays sensible at any grid size.
+  const toolbarH = 96;   // build-menu band overlaps the canvas bottom — keep clear
+  const topH = 34;       // live ticker band along the top — keep clear
+  const gridWpx = (GRID_W + GRID_D) * (TW / 2);   // screen width span at scale 1
+  const gridHpx = (GRID_W + GRID_D) * (TH / 2);   // screen height span at scale 1
+  const availW = W * 0.94;
+  const availH = (H - toolbarH - topH) * 0.94;
+  view.sc = clamp(Math.min(availW / gridWpx, availH / gridHpx), 0.35, 1.5);
   const sc = effSc();
+  // centre (x-y) midpoint = (GRID_W-GRID_D)/2 at W/2
+  view.ox = Math.round(W * 0.5 - (GRID_W - GRID_D) * (TW / 4) * sc);
+  // centre (x+y) midpoint vertically in the band between ticker and toolbar
   const gridH = (GRID_W + GRID_D) * (TH / 2) * sc;
-  const toolbarH = 46;
-  view.oy = Math.max(8, Math.round((H - toolbarH - gridH) / 2));
+  view.oy = Math.max(topH, Math.round(topH + (H - toolbarH - topH - gridH) / 2));
 }
 function iso(x,y,z){
   const sc = effSc();
@@ -1086,31 +1130,103 @@ function prism(x,y,w,d,h,col,opt){
 // ── factory animation + ambient agents ──────────────────────────────────────
 function setSimState(state){ factorySimState = state; }
 
+// Real sim-derived activity: how hard the factory is running this quarter.
+// util = units built / total capacity → 0 (idle/failing) … 1 (flat out).
+function simActivity(){
+  let units=0, util=0;
+  if(factorySimState){
+    units = factorySimState.lastUnits || 0;
+    const cap = deriveCampusInputs(campus).capacity;
+    util = cap>0 ? clamp(units/cap, 0, 1) : 0;
+  }
+  // a touch of baseline life even when idle, so the campus is never fully dead
+  const busy = clamp(0.12 + util*0.88, 0, 1);
+  return { units, util, busy };
+}
+
+const lerp=(a,b,t)=>a+(b-a)*t;
+function plantList(){ return campus.objects.filter(o=>o.type==='assembly'); }
+function tileOccupied(x,y){
+  return campus.objects.some(o=>{ const d=def(o.type);
+    return x>=o.x && x<o.x+d.w && y>=o.y && y<o.y+d.d; });
+}
+// the campus gate: cars roll out toward the right edge
+function gatePoint(){ return { x: GRID_W-0.5, y: Math.round(GRID_D*0.5)+0.5 }; }
+// finished-car colours: cycle the player's active-model bodystyle colours
+function fleetColors(){
+  const out=[];
+  if(factorySimState){
+    const player=factorySimState.companies&&factorySimState.companies.find(c=>c.player);
+    if(player&&player.models) player.models.filter(m=>m.active).forEach(m=>{
+      out.push(BS_COLORS_WORLD[m.segId]||'#F2A33C');
+    });
+  }
+  return out.length?out:['#F2A33C'];
+}
+
 function stepAgents(dt){
-  // reinitialize when campus changes size (building placed/removed)
-  const stamp = campus.objects.length;
+  const act = simActivity();
+  const tier = Math.round(act.busy*4);                 // 0..4 — quantised so we don't churn
+  const bc = campus.objects.length;
+  const stamp = bc + ':' + tier;
   if(stamp !== agentCampusStamp){
     agentCampusStamp = stamp;
     agents = [];
-    for(let i=0;i<3;i++) agents.push({
+    // workers scale with both how built-out the campus is and how busy it is
+    const workerN = Math.min(2 + bc + Math.round(act.busy*10), 38);
+    for(let i=0;i<workerN;i++) agents.push({
       type:'worker', ph:Math.random()*6.28,
       x:0.5+Math.random()*(GRID_W-1), y:0.5+Math.random()*(GRID_D-1),
       tx:0.5+Math.random()*(GRID_W-1), ty:0.5+Math.random()*(GRID_D-1)
     });
-    if(campus.objects.some(o=>o.type==='assembly'))
-      agents.push({type:'forklift',ph:0,x:2,y:1,tx:3,ty:4});
+    // forklifts buzz around the plants, more of them when output is high
+    const plants = plantList();
+    const forkN = Math.min(plants.length * (1 + Math.round(act.busy*2)), 12);
+    for(let i=0;i<forkN;i++){
+      const p = plants[i % plants.length] || {x:2,y:1};
+      const pd = def(p.type||'assembly');
+      agents.push({ type:'forklift', ph:0,
+        x:p.x+Math.random()*pd.w, y:p.y+Math.random()*pd.d,
+        tx:p.x+Math.random()*pd.w, ty:p.y+Math.random()*pd.d });
+    }
   }
+  const speedMul = 0.8 + act.busy*0.7;   // busier campus = faster motion
   agents.forEach(a=>{
     const dx=a.tx-a.x, dy=a.ty-a.y, dist=Math.hypot(dx,dy);
     if(dist<0.18){
       a.tx=0.5+Math.random()*(GRID_W-1);
       a.ty=0.5+Math.random()*(GRID_D-1);
     } else {
-      const spd=a.type==='forklift'?0.72:0.42;
+      const spd=(a.type==='forklift'?0.72:0.42)*speedMul;
       a.x+=dx/dist*spd*dt; a.y+=dy/dist*spd*dt;
     }
-    a.ph+=dt*(a.type==='worker'?5.5:2.5);
+    a.ph+=dt*(a.type==='worker'?5.5:2.5)*speedMul;
   });
+
+  // finished cars roll out of the plants toward the gate; spawn rate ∝ production,
+  // and the burst right after Advance briefly floods the lot.
+  const plants = plantList();
+  if(plants.length && act.units>0){
+    const burstBoost = burstT>0 ? 2.4 : 1;
+    const interval = lerp(2.6, 0.35, act.busy) / burstBoost;
+    const maxCars = Math.min(2 + Math.round(act.busy*16), 22);
+    carSpawnT -= dt;
+    if(carSpawnT<=0 && cars.length<maxCars){
+      carSpawnT = interval*(0.6+Math.random()*0.8);
+      const p = plants[Math.floor(Math.random()*plants.length)];
+      const pd = def(p.type);
+      const cols = fleetColors();
+      cars.push({ type:'car',
+        x:p.x+pd.w*0.5, y:p.y+pd.d*0.5,
+        tx:gatePoint().x, ty:gatePoint().y,
+        color:cols[Math.floor(Math.random()*cols.length)] });
+    }
+  }
+  for(let i=cars.length-1;i>=0;i--){
+    const c=cars[i], dx=c.tx-c.x, dy=c.ty-c.y, dist=Math.hypot(dx,dy);
+    if(dist<0.4){ cars.splice(i,1); continue; }
+    const spd=0.9*speedMul; c.x+=dx/dist*spd*dt; c.y+=dy/dist*spd*dt;
+  }
 }
 
 function drawAgent(a){
@@ -1126,34 +1242,142 @@ function drawAgent(a){
   }
 }
 
+// a small finished car (driving or parked), coloured by bodystyle
+function drawSmallCar(x,y,color){
+  const p=iso(x,y,0.05); const s=3.4*effSc();
+  ctx.fillStyle='rgba(0,0,0,0.28)';
+  ctx.beginPath(); ctx.ellipse(p.x,p.y+s*0.5,s*1.25,s*0.55,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle=color; ctx.fillRect(p.x-s,p.y-s*0.62,s*2,s*1.05);
+  ctx.fillStyle='rgba(255,255,255,0.30)'; ctx.fillRect(p.x-s*0.55,p.y-s*0.5,s*1.1,s*0.4);
+}
+
+// finished-goods lot: cars accumulate on the paved apron, count ∝ recent output
+function drawParkedCars(){
+  const act = simActivity();
+  const want = Math.min(Math.round(act.units/12), 26);
+  if(want<=0) return;
+  const dev = developedTiles();
+  const free = [];
+  dev.forEach(k=>{ const [x,y]=k.split(',').map(Number); if(!tileOccupied(x,y)) free.push({x,y}); });
+  free.sort((a,b)=> (a.y-b.y)||(a.x-b.x));
+  const cols = fleetColors();
+  let placed=0;
+  for(const t of free){
+    for(let s=0;s<2 && placed<want;s++){
+      drawSmallCar(t.x+0.32+s*0.4, t.y+0.55, cols[placed % cols.length]);
+      placed++;
+    }
+    if(placed>=want) break;
+  }
+}
+
 function drawBuildingAnimated(o){
   const d=def(o.type), lv=d.levels[o.level];
   if(o.type==='assembly'){
     const cap=capacityOf(o);
     const util=cap>0?Math.min(o.lastOutput/cap,1):0;
-    if(util<=0) return;
     const beltD=o.y+d.d*0.42, beltH=lv.h*0.82;
-    const bl=iso(o.x+0.22,beltD,beltH), br=iso(o.x+d.w-0.22,beltD,beltH);
-    ctx.strokeStyle='rgba(80,90,105,0.65)'; ctx.lineWidth=2.2*effSc();
-    ctx.beginPath(); ctx.moveTo(bl.x,bl.y); ctx.lineTo(br.x,br.y); ctx.stroke();
-    // car color from latest active model
-    let carColor='#F2A33C';
+
+    // read sim state once
+    let player=null, hasRecall=false, isCapped=false, isStale=false, carColor='#F2A33C';
     if(factorySimState){
-      const player=factorySimState.companies&&factorySimState.companies.find(c=>c.player);
+      player=factorySimState.companies&&factorySimState.companies.find(c=>c.player);
       if(player){
-        const m=player.models&&player.models.filter(x=>x.active).slice(-1)[0];
-        if(m) carColor=BS_COLORS_WORLD[m.segId]||'#F2A33C';
+        const active=player.models&&player.models.filter(x=>x.active)||[];
+        hasRecall=active.some(m=>m.recallQ>0);
+        isStale=active.some(m=>m.novelty<0.36);
+        const lastM=active.slice(-1)[0];
+        if(lastM) carColor=BS_COLORS_WORLD[lastM.segId]||'#F2A33C';
+        isCapped=(factorySimState.lastCapFill!=null&&factorySimState.lastCapFill<0.97);
       }
     }
-    const nCars=Math.max(1,Math.round(util*3));
-    for(let i=0;i<nCars;i++){
-      const ph=((wT*0.28+i/nCars)%1);
-      const cx=o.x+0.25+(d.w-0.5)*ph;
-      const cp=iso(cx,beltD,beltH+0.09);
-      const r=4.5*effSc();
-      ctx.fillStyle=carColor; ctx.strokeStyle='rgba(0,0,0,.35)'; ctx.lineWidth=0.9;
-      ctx.beginPath(); ctx.arc(cp.x,cp.y,r,0,Math.PI*2); ctx.fill(); ctx.stroke();
+
+    // stale → desaturate car color to dusty amber
+    const drawColor = isStale ? '#998870' : carColor;
+
+    // draw util is boosted during the post-advance burst
+    const inBurst = burstT > 0;
+    const burstAlpha = inBurst ? Math.min(1, burstT) : 0;
+    const drawUtil = inBurst ? Math.max(util, 0.18 + burstAlpha * 0.5) : util;
+
+    if(drawUtil>0){
+      // conveyor belt
+      const bl=iso(o.x+0.22,beltD,beltH), br=iso(o.x+d.w-0.22,beltD,beltH);
+      ctx.strokeStyle='rgba(80,90,105,0.65)'; ctx.lineWidth=2.2*effSc();
+      ctx.beginPath(); ctx.moveTo(bl.x,bl.y); ctx.lineTo(br.x,br.y); ctx.stroke();
+
+      // belt cars — more during burst, speed tied to wT
+      const beltSpeed = inBurst ? 0.38 + burstAlpha*0.22 : 0.28;
+      const nCars=Math.max(1, Math.round(drawUtil*(inBurst?4:3)));
+      for(let i=0;i<nCars;i++){
+        const ph=((wT*beltSpeed+i/nCars)%1);
+        const cx=o.x+0.25+(d.w-0.5)*ph;
+        const cp=iso(cx,beltD,beltH+0.09);
+        const r=4.5*effSc();
+        ctx.fillStyle=drawColor; ctx.strokeStyle='rgba(0,0,0,.35)'; ctx.lineWidth=0.9;
+        ctx.beginPath(); ctx.arc(cp.x,cp.y,r,0,Math.PI*2); ctx.fill(); ctx.stroke();
+      }
+
+      // burst: car dots streaming OUT of belt exit toward grid edge (1–2s)
+      if(inBurst && util>0){
+        for(let i=0;i<3;i++){
+          const ph=((2.5-burstT)*0.65+i/3)%1;
+          const cx=o.x+d.w-0.15+ph*1.8, cy=beltD+ph*0.6;
+          const fp=iso(cx,cy,beltH+0.09);
+          const r=3.5*effSc()*(1-ph*0.55);
+          ctx.fillStyle=drawColor; ctx.globalAlpha=0.85*(1-ph);
+          ctx.beginPath(); ctx.arc(fp.x,fp.y,r,0,Math.PI*2); ctx.fill();
+          ctx.globalAlpha=1;
+        }
+      }
     }
+
+    // ── sim-state overlays (draw regardless of util) ──────────────────────
+
+    // recall ⚠ — pulsing red glyph above the building roof
+    if(hasRecall){
+      const pulse=0.5+Math.sin(wT*4.8)*0.5;
+      const rp=iso(o.x+d.w*0.5,o.y+d.d*0.5,lv.h+0.55);
+      ctx.save();
+      ctx.globalAlpha=0.6+pulse*0.35;
+      ctx.fillStyle='#E5605E';
+      ctx.font=`bold ${Math.round(15*effSc())}px sans-serif`;
+      ctx.textAlign='center';
+      ctx.fillText('⚠',rp.x,rp.y);
+      ctx.restore();
+    }
+
+    // bottleneck/capped — stacked red dots piling at belt exit + "FULL" label
+    if(isCapped){
+      const exitP=iso(o.x+d.w-0.05,beltD+0.18,beltH+0.09);
+      for(let q=0;q<3;q++){
+        const qx=exitP.x+(q*4.5)*effSc(), qy=exitP.y-(q*5.5)*effSc();
+        ctx.fillStyle=`rgba(229,96,94,${0.82-q*0.22})`;
+        ctx.strokeStyle='rgba(0,0,0,.3)'; ctx.lineWidth=0.7;
+        ctx.beginPath(); ctx.arc(qx,qy,(3.5-q*0.4)*effSc(),0,Math.PI*2);
+        ctx.fill(); ctx.stroke();
+      }
+      const lp=iso(o.x+d.w/2,o.y-0.12,lv.h+0.72);
+      ctx.fillStyle='#E5605E';
+      ctx.font=`600 ${Math.round(9*effSc())}px IBM Plex Mono,monospace`;
+      ctx.textAlign='center';
+      ctx.fillText('FULL',lp.x,lp.y);
+    }
+
+    // stale — dusty motes drifting upward from the roofline
+    if(isStale){
+      for(let p=0;p<4;p++){
+        const ph=(wT*0.32+p*0.25)%1;
+        const px=o.x+0.6+p*(d.w-1.2)/3, py=o.y+d.d*0.52;
+        const pp=iso(px,py,lv.h*0.72+ph*0.95);
+        const r=(1.8+ph)*effSc();
+        ctx.globalAlpha=0.52*(1-ph);
+        ctx.fillStyle='#9A8C7E';
+        ctx.beginPath(); ctx.arc(pp.x,pp.y,r,0,Math.PI*2); ctx.fill();
+        ctx.globalAlpha=1;
+      }
+    }
+
   } else if(o.type==='rdlab'){
     const pulse=(Math.sin(wT*1.8)*0.5+0.5);
     const p=iso(o.x+d.w/2,o.y+d.d/2,lv.h+0.22);
@@ -1167,6 +1391,31 @@ function drawBuildingAnimated(o){
     const p=iso(o.x+d.w/2,o.y,lv.h+0.32);
     ctx.fillStyle=`rgba(124,111,214,${0.42+pulse*0.38})`;
     ctx.beginPath(); ctx.arc(p.x,p.y,(2.8+pulse*2.2)*effSc(),0,Math.PI*2); ctx.fill();
+  } else if(o.type==='testtrack'){
+    // Animated speed lines — a short dash sweeping left-to-right over the track
+    const sc=effSc(), ctr=iso(o.x+d.w/2, o.y+d.d/2, lv.h+0.12);
+    const ph=((wT*0.8) % 1);
+    const trackW=d.w*TW*sc*0.72, lineW=trackW*0.28;
+    const x0=ctr.x - trackW/2 + ph*trackW;
+    ctx.save();
+    ctx.globalAlpha=0.55;
+    ctx.strokeStyle='#F0B040'; ctx.lineWidth=2.2*sc;
+    ctx.beginPath(); ctx.moveTo(x0,ctr.y); ctx.lineTo(Math.min(x0+lineW,ctr.x+trackW/2),ctr.y);
+    ctx.stroke();
+    ctx.globalAlpha=0.28;
+    ctx.strokeStyle='#F0B040'; ctx.lineWidth=1.1*sc;
+    const x1=ctr.x - trackW/2 + ((ph+0.55)%1)*trackW;
+    ctx.beginPath(); ctx.moveTo(x1,ctr.y+2*sc); ctx.lineTo(Math.min(x1+lineW*0.7,ctr.x+trackW/2),ctr.y+2*sc);
+    ctx.stroke();
+    ctx.restore();
+  } else if(o.type==='qualitycenter'){
+    // Slow-pulsing green glow — steady quality signal
+    const pulse=(Math.sin(wT*1.2)*0.5+0.5);
+    const p=iso(o.x+d.w/2,o.y+d.d/2,lv.h+0.2);
+    ctx.strokeStyle=`rgba(78,154,110,${0.22+pulse*0.38})`; ctx.lineWidth=1.8;
+    ctx.beginPath(); ctx.arc(p.x,p.y,(5+pulse*4)*effSc(),0,Math.PI*2); ctx.stroke();
+    ctx.strokeStyle=`rgba(78,154,110,${0.08+pulse*0.12})`; ctx.lineWidth=0.9;
+    ctx.beginPath(); ctx.arc(p.x,p.y,(9+pulse*5)*effSc(),0,Math.PI*2); ctx.stroke();
   }
 }
 
@@ -1182,6 +1431,13 @@ function buildTooltipHtml(o){
     const label={eng:'Powertrain',eff:'Reliability',mfg:'Manufacturing'}[o.labFocus||'eng'];
     return `<b>${d.name} L${o.level}</b> · +$${o.level>=2?60:30}M/q ${label}`;
   }
+  if(o.type==='testtrack'){
+    return `<b>${d.name} L${o.level}</b> · +$${o.level>=2?50:25}M/q Eng · perf &amp; recall risk ↓`;
+  }
+  if(o.type==='qualitycenter'){
+    const wc = o.level>=2?30:15;
+    return `<b>${d.name} L${o.level}</b> · +$${o.level>=2?50:25}M/q Reliability · $${wc}M recall warranty`;
+  }
   return `<b>${d.name}</b>`;
 }
 
@@ -1191,6 +1447,26 @@ function getSelectedBuildingScreenPos(){
   const d=def(o.type), lv=d.levels[o.level];
   const p=iso(o.x+d.w/2, o.y, lv.h+0.4);
   return { x:p.x, y:p.y };
+}
+
+// Developed ground = every building footprint plus a paved apron around it. Cached
+// and only recomputed when the building layout changes, so the campus "grows" as a
+// side effect of building without re-walking the grid every frame.
+let _devCache = { sig:'', set:new Set() };
+function developedTiles(){
+  const sig = campus.objects.map(o=>o.type+o.x+','+o.y).join('|');
+  if(sig === _devCache.sig) return _devCache.set;
+  const set = new Set();
+  const APRON = 1;   // tiles of paving around each footprint
+  campus.objects.forEach(o=>{
+    const d=def(o.type);
+    for(let x=o.x-APRON; x<o.x+d.w+APRON; x++)
+      for(let y=o.y-APRON; y<o.y+d.d+APRON; y++){
+        if(x>=0 && y>=0 && x<GRID_W && y<GRID_D) set.add(x+','+y);
+      }
+  });
+  _devCache = { sig, set };
+  return set;
 }
 
 // ── render ───────────────────────────────────────────────────────────────────
@@ -1203,10 +1479,17 @@ function render(){
   g.addColorStop(0,'#0e1320'); g.addColorStop(1,'#141b2b');
   ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
 
-  // ground tiles
+  // ground tiles — developed (paved campus) tiles spread around buildings, so the
+  // site visibly grows from a lone startup plot into a sprawling industrial campus.
+  const dev = developedTiles();
   for(let x=0;x<GRID_W;x++) for(let y=0;y<GRID_D;y++){
-    const lot = (x+y)%2===0 ? '#283142' : '#2d3749';
-    tile(x,y,lot,'rgba(255,255,255,.05)');
+    if(dev.has(x+','+y)){
+      const lot = (x+y)%2===0 ? '#283142' : '#2d3749';   // paved campus lot
+      tile(x,y,lot,'rgba(255,255,255,.05)');
+    } else {
+      const raw = (x+y)%2===0 ? '#212c3e' : '#263247';   // undeveloped ground (room to grow)
+      tile(x,y,raw,'rgba(255,255,255,.035)');
+    }
   }
 
   // build-mode ghost footprint highlight (under buildings)
@@ -1218,11 +1501,20 @@ function render(){
     }
   }
 
-  // buildings + agents, depth-sorted
-  const drawList = campus.objects.map(o=>({ o, z:o.x+o.y }));
-  drawList.sort((a,b)=>a.z-b.z);
-  for(const it of drawList){ drawBuilding(it.o); drawBuildingAnimated(it.o); }
-  agents.forEach(a=>drawAgent(a));
+  // finished-goods lot on the apron (under buildings/agents so cars sit on the ground)
+  drawParkedCars();
+
+  // buildings + agents + driving cars, depth-sorted together so nearer things overlap
+  const drawList = [];
+  campus.objects.forEach(o=>drawList.push({ kind:'b', z:o.x+o.y, o }));
+  agents.forEach(a=>drawList.push({ kind:'a', z:a.x+a.y, a }));
+  cars.forEach(c=>drawList.push({ kind:'c', z:c.x+c.y, c }));
+  drawList.sort((p,q)=>p.z-q.z);
+  for(const it of drawList){
+    if(it.kind==='b'){ drawBuilding(it.o); drawBuildingAnimated(it.o); }
+    else if(it.kind==='a'){ drawAgent(it.a); }
+    else { drawSmallCar(it.c.x, it.c.y, it.c.color); }
+  }
 
   // ghost building silhouette + a one-line hint (snapped / why-invalid)
   if(buildType && ghost.on && inBounds(buildType,ghost.x,ghost.y)){
@@ -1381,6 +1673,7 @@ function onClick(ev){
     const res = place(campus, buildType, ghost.x, ghost.y, cash);
     if(res.ok){
       if(opts.onSpend) opts.onSpend(res.cost);
+      if(opts.onAction) opts.onAction('place', { type: buildType, obj: campus.objects.find(o=>o.id===res.id) });
       campus.selectedId = res.id;
       changed();
       // stay armed for rapid placement; disarm only if the next one is unaffordable
@@ -1415,7 +1708,7 @@ function renderPanels(){
   renderMenu();
   renderInspector();
 }
-const BUILDABLE = ['assembly','studio','rdlab'];
+const BUILDABLE = ['assembly','studio','rdlab','testtrack','qualitycenter'];
 function renderMenu(){
   if(!opts.menuEl) return;
   if(opts.onArmChange) opts.onArmChange(!!buildType);
@@ -1431,7 +1724,7 @@ function renderMenu(){
   }).join('');
   const hint = buildType
     ? `<b style="color:var(--amber)">● Armed</b> — click any tile to build (stays armed for more). <b>Esc</b> or right-click to cancel.`
-    : `Plants add capacity (now <b>${inputs.capacity}k</b>/q). The <b style="color:#a89bf0">Design Studio</b> is where you develop &amp; redesign models${studio.present?` — you have one (L${studio.level}).`:` — build one to design in-game.`}`;
+    : `Plants add capacity (now <b>${inputs.capacity}k</b>/q). <b style="color:#a89bf0">Studio</b> = design. <b style="color:#3B8EA5">R&amp;D Lab</b> = research bonus. <b style="color:#C87941">Test Track</b> = perf + recall risk ↓. <b style="color:#4E9A6E">Quality Center</b> = reliability + warranty.`;
   opts.menuEl.innerHTML = btns +
     `<div class="wbuild-hint">${hint}${flashT>0?` <span style="color:var(--red)">· ${flashMsg}</span>`:''}</div>`;
 }
@@ -1521,6 +1814,53 @@ function renderInspector(){
     if(opts.onInspectorUpdated) opts.onInspectorUpdated(o.id);
     return;
   }
+  if(o.type==='testtrack'){
+    const d=def(o.type);
+    const upCost=upgradeCostOf(o);
+    const cash = opts.getCash? opts.getCash():0;
+    const canUp = upCost!=null && cash>=upCost;
+    const engBonus = o.level>=2 ? 50 : 25;
+    opts.inspectorEl.innerHTML =
+      `<div class="winsp-name">${d.name} <span class="winsp-lvl">Level ${o.level}</span></div>
+       <div class="winsp-grid">
+         <div><span class="wk">Eng R&amp;D boost</span><span class="wv">+$${engBonus}M/q</span></div>
+         <div><span class="wk">Effect</span><span class="wv" style="font-size:11px">Perf ↑ · recall risk ↓</span></div>
+         <div><span class="wk">Coupe halo</span><span class="wv">${o.level>=2?'Amplified':'Standard'}</span></div>
+         <div><span class="wk">Footprint</span><span class="wv">${d.w}×${d.d}</span></div>
+       </div>
+       <div class="winsp-actions">
+         ${upCost!=null
+           ? `<button class="btn primary" ${canUp?'':'disabled'} onclick="MarqueWorld.upgradeSelected()">Upgrade to L${o.level+1} · $${upCost}M</button>`
+           : `<button class="btn" disabled>Max level</button>`}
+         <button class="btn danger" onclick="MarqueWorld.demolishSelected()">Demolish</button>
+       </div>`;
+    if(opts.onInspectorUpdated) opts.onInspectorUpdated(o.id);
+    return;
+  }
+  if(o.type==='qualitycenter'){
+    const d=def(o.type);
+    const upCost=upgradeCostOf(o);
+    const cash = opts.getCash? opts.getCash():0;
+    const canUp = upCost!=null && cash>=upCost;
+    const effBonus = o.level>=2 ? 50 : 25;
+    const wc = o.level>=2 ? 30 : 15;
+    opts.inspectorEl.innerHTML =
+      `<div class="winsp-name">${d.name} <span class="winsp-lvl">Level ${o.level}</span></div>
+       <div class="winsp-grid">
+         <div><span class="wk">Eff R&amp;D boost</span><span class="wv">+$${effBonus}M/q</span></div>
+         <div><span class="wk">Effect</span><span class="wv" style="font-size:11px">Reliability ↑ · recall risk ↓</span></div>
+         <div><span class="wk">Warranty</span><span class="wv" style="color:var(--green)">$${wc}M/recall covered</span></div>
+         <div><span class="wk">Footprint</span><span class="wv">${d.w}×${d.d}</span></div>
+       </div>
+       <div class="winsp-actions">
+         ${upCost!=null
+           ? `<button class="btn primary" ${canUp?'':'disabled'} onclick="MarqueWorld.upgradeSelected()">Upgrade to L${o.level+1} · $${upCost}M</button>`
+           : `<button class="btn" disabled>Max level</button>`}
+         <button class="btn danger" onclick="MarqueWorld.demolishSelected()">Demolish</button>
+       </div>`;
+    if(opts.onInspectorUpdated) opts.onInspectorUpdated(o.id);
+    return;
+  }
   const d=def(o.type), cap=capacityOf(o), util=cap>0?Math.round(clamp(o.lastOutput/cap,0,1)*100):0;
   const upCost=upgradeCostOf(o);
   const cash = opts.getCash? opts.getCash():0;
@@ -1554,7 +1894,12 @@ function upgradeSelected(){
   const id=campus.selectedId; if(id==null) return;
   const cash=opts.getCash?opts.getCash():Infinity;
   const res=upgrade(campus,id,cash);
-  if(res.ok){ if(opts.onSpend) opts.onSpend(res.cost); changed(); } else flash(res.reason);
+  if(res.ok){
+    if(opts.onSpend) opts.onSpend(res.cost);
+    const o = campus.objects.find(ob=>ob.id===id);
+    if(opts.onAction) opts.onAction('upgrade', { type: o ? o.type : null, obj: o });
+    changed();
+  } else flash(res.reason);
 }
 function demolishSelected(){
   const id=campus.selectedId; if(id==null) return;
@@ -1571,8 +1916,11 @@ function setLabFocus(id, focus){
 }
 
 // ── lifecycle ────────────────────────────────────────────────────────────────
+function triggerBurst(){ burstT = 2.5; }
+
 function step(dt){
   wT += dt;
+  if(burstT > 0) burstT = Math.max(0, burstT - dt);
   if(flashT>0){ flashT-=dt; if(flashT<=0){ flashT=0; renderMenu(); } }
   stepAgents(dt);
 }
@@ -1629,13 +1977,16 @@ return {
   init, getCampus, loadCampus, resetCampus, step, render, renderPanels,
   toggleBuild, upgradeSelected, demolishSelected, studioAction, setLabFocus,
   // new in rebuild
-  setSimState, getSelectedBuildingScreenPos,
+  setSimState, getSelectedBuildingScreenPos, triggerBurst,
+  // presentation helpers exposed for headless tests
+  developedTiles, simActivity,
 };
 
 })();
+
 </script>
 <style>
-:root{
+  :root{
     --bg:#15171C; --panel:#1D2026; --panel2:#22262E; --line:#2E333D;
     --hi:#ECEEF1; --dim:#8A9099; --dimmer:#5C636E;
     --amber:#F2A33C; --green:#4FD08A; --red:#E5605E;
@@ -1679,6 +2030,12 @@ return {
   .seg{border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:12px;background:var(--panel2)}
   .seg:last-child{margin-bottom:0}
   .seg-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px}
+  .seg--empty{opacity:.7;padding:9px 12px}
+  .seg--empty .seg-head{margin-bottom:5px;gap:8px;flex-wrap:nowrap}
+  .seg--empty .seg-name{font-size:13px;font-weight:600;white-space:nowrap}
+  .seg--empty .seg-meta{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .seg--empty .sharebar{margin-top:5px}
+  .seg--empty .leg{display:none}
   .seg-name{font-weight:700;font-size:15px}
   .seg-meta{font-family:var(--mono);font-size:11px;color:var(--dim)}
 
@@ -1756,6 +2113,13 @@ return {
 
   /* ── advance ── */
   .advance{position:sticky;bottom:14px;margin-top:6px;z-index:5}
+  .advisor-card{background:rgba(242,163,60,.07);border:1px solid rgba(242,163,60,.3);
+    border-radius:10px;padding:9px 13px;font-size:12px;font-family:var(--mono);
+    color:var(--fg);margin-bottom:8px;line-height:1.5}
+  .advisor-card::before{content:'▶  ';color:var(--amber);font-size:9px}
+  .advisor-card.actionable{cursor:pointer;transition:background .15s,border-color .15s}
+  .advisor-card.actionable:hover{background:rgba(242,163,60,.14);border-color:rgba(242,163,60,.6)}
+  .advisor-card.actionable::after{content:' →';color:var(--amber);font-size:10px;opacity:.7}
   #advBtn{width:100%;font-family:var(--sans);font-weight:800;font-size:16px;
     letter-spacing:.08em;text-transform:uppercase;color:#10141C;background:var(--amber);
     border:none;border-radius:12px;padding:16px;cursor:pointer;
@@ -1810,6 +2174,52 @@ return {
     padding:9px 14px;border-top:1px solid var(--line);
     display:flex;gap:8px;align-items:center;flex-wrap:wrap;z-index:3}
 
+  /* ── live broadcast ticker (Task 3) ── */
+  .ticker-band{position:absolute;top:0;left:0;right:0;height:26px;z-index:5;
+    background:linear-gradient(90deg,rgba(12,14,20,.96),rgba(18,22,32,.93));
+    border-bottom:1px solid rgba(242,163,60,.25);overflow:hidden;
+    display:flex;align-items:center;font-family:var(--mono);font-size:11px;white-space:nowrap;
+    -webkit-mask-image:linear-gradient(90deg,transparent,#000 4%,#000 97%,transparent);
+    mask-image:linear-gradient(90deg,transparent,#000 4%,#000 97%,transparent)}
+  .ticker-band::before{content:'● LIVE';position:absolute;left:0;top:0;bottom:0;z-index:2;
+    display:flex;align-items:center;padding:0 9px;color:#E5605E;font-weight:700;font-size:9px;
+    letter-spacing:.1em;background:rgba(10,12,18,.99);border-right:1px solid rgba(242,163,60,.3)}
+  .ticker-track{display:inline-flex;align-items:center;will-change:transform;padding-left:62px}
+  .tk-item{display:inline-flex;align-items:center;gap:6px;padding:0 16px;
+    border-right:1px solid rgba(255,255,255,.07);color:var(--dim)}
+  .tk-k{color:var(--dimmer);letter-spacing:.05em;font-size:9px;text-transform:uppercase}
+  .tk-v{color:var(--hi);font-weight:700}
+  .tk-up{color:var(--green)} .tk-down{color:var(--red)} .tk-flat{color:var(--dim)}
+  .tk-stock .tk-v{color:var(--amber)}
+  .tk-recall{color:#E5605E;font-weight:700;animation:tkBlink 1s steps(2,jump-none) infinite}
+  @keyframes tkBlink{50%{opacity:.35}}
+
+  /* ── rival scoreboard (Task 4) ── */
+  .world-scoreboard{position:absolute;top:34px;right:10px;z-index:4;width:190px;
+    background:rgba(14,17,24,.84);backdrop-filter:blur(6px);
+    border:1px solid var(--line);border-radius:10px;padding:8px 10px;
+    font-family:var(--mono);pointer-events:none}
+  .wsb-title{font-size:8px;letter-spacing:.14em;color:var(--dimmer);text-transform:uppercase;margin-bottom:4px}
+  .wsb-rival{padding:5px 0;border-top:1px solid rgba(255,255,255,.06)}
+  .wsb-head{display:flex;align-items:center;gap:6px}
+  .wsb-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+  .wsb-name{font-weight:700;color:var(--hi);font-size:11px}
+  .wsb-tag{font-size:8px;color:var(--dimmer);margin-left:2px}
+  .wsb-share{margin-left:auto;font-weight:700;font-size:11px}
+  .wsb-move{font-size:8.5px;color:var(--dim);margin-top:2px;line-height:1.3;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+  /* ── valuation readout + sparkline (Task 5) ── */
+  .world-valuation{position:absolute;top:34px;left:10px;z-index:4;
+    background:rgba(14,17,24,.84);backdrop-filter:blur(6px);
+    border:1px solid var(--line);border-radius:10px;padding:8px 11px;
+    font-family:var(--mono);pointer-events:none;min-width:132px}
+  .wv-k{font-size:8px;letter-spacing:.14em;color:var(--dimmer);text-transform:uppercase}
+  .wv-price{font-size:20px;font-weight:800;color:var(--amber);line-height:1.05;margin-top:2px}
+  .wv-trend{font-size:10px;font-weight:700;margin-left:5px;vertical-align:middle}
+  .wv-sub{font-size:8.5px;color:var(--dimmer);margin-top:1px}
+  .wv-spark{margin-top:5px;display:block}
+
   /* ── world inspector popup + hover tooltip (fixed overlays) ── */
   .world-inspector{position:fixed;background:rgba(26,29,36,.97);border:1px solid var(--line);
     border-radius:11px;padding:13px 14px;width:248px;
@@ -1839,6 +2249,52 @@ return {
   .winsp-grid .wv{font-family:var(--mono);font-size:15px;font-weight:600;color:var(--hi);margin-top:2px}
   .winsp-actions{display:flex;gap:6px;flex-wrap:wrap}
   .winsp-note{font-family:var(--mono);font-size:9px;color:var(--dimmer);margin-top:9px;letter-spacing:.04em}
+
+  /* ── floater feedback ── */
+  .floater{position:fixed;left:50%;transform:translateX(-50%);
+    background:rgba(26,29,36,.95);border:1px solid var(--line);border-radius:20px;
+    padding:5px 14px;font-family:var(--mono);font-size:11px;font-weight:600;
+    pointer-events:none;z-index:210;white-space:nowrap;
+    animation:floatUp 2.2s ease forwards}
+  @keyframes floatUp{
+    0%{opacity:0;transform:translateX(-50%) translateY(0)}
+    15%{opacity:1;transform:translateX(-50%) translateY(-8px)}
+    70%{opacity:1;transform:translateX(-50%) translateY(-22px)}
+    100%{opacity:0;transform:translateX(-50%) translateY(-38px)}
+  }
+
+  /* ── rival personality cards (Market tab) ── */
+  .rival-card{background:var(--panel2);border:1px solid var(--line);border-radius:9px;
+    padding:10px 13px;display:flex;gap:10px;align-items:flex-start}
+  .rival-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;margin-top:4px}
+  .rival-name{font-weight:700;font-size:13px;margin-bottom:2px}
+  .rival-tag{font-family:var(--mono);font-size:9px;color:var(--dim);letter-spacing:.06em;margin-bottom:6px}
+  .rival-stats{font-family:var(--mono);font-size:10px;color:var(--dimmer);display:flex;gap:10px;flex-wrap:wrap}
+  .rival-stats b{color:var(--hi)}
+
+  /* ── model review card (Motor1-style, shown on launch/redesign) ── */
+  #reviewCard{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
+    background:var(--panel);border:1px solid var(--amber);border-radius:14px;
+    padding:20px 22px;min-width:280px;max-width:340px;z-index:220;
+    font-family:var(--mono);box-shadow:0 8px 32px rgba(0,0,0,.55);
+    animation:reviewIn .22s ease}
+  @keyframes reviewIn{from{opacity:0;transform:translate(-50%,-54%)}to{opacity:1;transform:translate(-50%,-50%)}}
+  .rv-brand{font-size:8px;letter-spacing:.24em;text-transform:uppercase;color:var(--amber);margin-bottom:10px}
+  .rv-name{font-size:22px;font-weight:700;color:var(--hi);line-height:1;margin-bottom:2px}
+  .rv-spec{font-size:10px;color:var(--dim);margin-bottom:14px}
+  .rv-verdict{font-size:14px;font-style:italic;color:var(--hi);
+    border-left:2px solid var(--amber);padding-left:10px;margin-bottom:14px;line-height:1.45}
+  .rv-row{display:flex;justify-content:space-between;padding:5px 0;
+    border-bottom:1px solid var(--line);font-size:10px}
+  .rv-row:last-of-type{border-bottom:none}
+  .rv-lbl{color:var(--dim);letter-spacing:.1em;text-transform:uppercase;font-size:9px}
+  .rv-val{color:var(--hi);font-weight:600;text-align:right;max-width:180px}
+  .rv-rival{color:var(--red)}
+  .rv-dismiss{display:block;width:100%;margin-top:14px;font-family:var(--mono);font-size:11px;
+    background:transparent;color:var(--dim);border:1px solid var(--line);border-radius:7px;
+    padding:7px;cursor:pointer}
+  .rv-dismiss:hover{color:var(--hi);border-color:rgba(255,255,255,.25)}
+  #reviewOverlay{position:fixed;inset:0;z-index:219;background:rgba(10,12,18,.55)}
 
   /* ── dashboard tabs ── */
   .dashboard{margin-bottom:14px}
@@ -1905,7 +2361,6 @@ return {
 </style>
 </head>
 <body>
-
 <header>
   <div class="brandmark">
     <div class="nm">Marque<span class="dot">.</span></div>
@@ -1921,6 +2376,12 @@ return {
 <!-- unified world canvas — the primary build and watch surface -->
 <div class="world-view" id="worldView">
   <canvas id="worldCanvas"></canvas>
+  <!-- live broadcast ticker (Task 3) — rotates real sim-derived items, animates between quarters -->
+  <div class="ticker-band" id="tickerBand"><div class="ticker-track" id="tickerTrack"></div></div>
+  <!-- valuation readout + sparkline (Task 5) -->
+  <div class="world-valuation" id="worldValuation"></div>
+  <!-- rival scoreboard (Task 4) -->
+  <div class="world-scoreboard" id="worldScoreboard"></div>
   <div class="world-toolbar" id="worldMenu"></div>
 </div>
 <div id="goalBanner"></div>
@@ -1942,6 +2403,7 @@ return {
   <div class="dash-panel" id="dashMarket" style="display:none">
     <svg class="chart" id="chart" viewBox="0 0 320 150" preserveAspectRatio="none"></svg>
     <div class="leg" id="chartleg"></div>
+    <div id="rivalCards" style="margin-top:16px;display:flex;flex-direction:column;gap:8px"></div>
   </div>
   <div class="dash-panel" id="dashLog" style="display:none">
     <div class="log" id="log"></div>
@@ -1961,6 +2423,10 @@ return {
 <!-- world inspector popup and tooltip — fixed-position, positioned by updateInspectorPopup() -->
 <div class="world-inspector" id="worldInspector" style="display:none"></div>
 <div class="world-tooltip" id="worldTooltip" style="display:none"></div>
+<!-- Motor1-style review card — shown on model launch/redesign, auto-dismisses -->
+<div id="reviewOverlay" style="display:none" onclick="dismissReviewCard()"></div>
+<div id="reviewCard" style="display:none"></div>
+
 <script>
 /* ── global state ─────────────────────────────────────────────────────────── */
 let st;
@@ -1969,12 +2435,178 @@ let pendingFactory = false;
 let studioSel = null;   // { segId, engId, trimId } while a design is in progress in the Studio overlay
 let launchSel = { segId:'sedan', engId:'I4', trimId:'mid' };
 let launchObjId = 'share';
+let launchSandbox = false;
 let _lastCash = 0, _lastShare = 0, _lastBrand = 0;
 const SAVE_KEY = 'marque.save.v4';
 
 const { newGame, advance, segShares, playerDesign, playerRefresh, playerRetire,
         quoteDesign, objectiveStatus, makeObjective, OBJECTIVES, endRecap,
         SEGS, ENGINES, TRIMS, C } = MarqueSim;
+
+/* ── model nameplates ─────────────────────────────────────────────────────── */
+const NAME_TABLE = {
+  sedan:  { I4:'Sentry',  V6:'Meridian', V8:'Regent',  Hybrid:'Aero',    EV:'Nexus'    },
+  suv:    { I4:'Terrain', V6:'Venture',  V8:'Summit',  Hybrid:'Range',   EV:'Volta'    },
+  pickup: { I4:'Scout',   V6:'Frontier', V8:'Titan',   Hybrid:'Relay',   EV:'Atlas'    },
+  coupe:  { I4:'Comet',   V6:'Vantage',  V8:'Apex',    Hybrid:'Eclipse', EV:'Spark'    },
+};
+function modelName(segId, engId){ return (NAME_TABLE[segId]||{})[engId] || `${engId} ${segId}`; }
+function getSeg(id){ return SEGS.find(s=>s.id===id)||{name:id}; }
+
+function ensureNameplates(st){
+  const p = st.companies && st.companies.find(c=>c.player);
+  if(p) p.models.forEach(m=>{ if(!m.nameplate) m.nameplate = modelName(m.segId, m.engId); });
+}
+
+/* Replace "your Sedan"/"your coupe"/"Your Coupe" and "the V8 coupe" in
+   log/recap text with the actual nameplate so prose feels personal. */
+function localizeHtml(html){
+  if(!st) return html;
+  const p = st.companies && st.companies.find(c=>c.player);
+  if(!p) return html;
+  let out = html;
+  p.models.forEach(m=>{
+    if(!m.nameplate) return;
+    const seg = getSeg(m.segId).name;                   // e.g. "Sedan"
+    const eng = ENGINES[m.engId] ? ENGINES[m.engId].name : '';
+    // Match "your"/"Your" + optional inline tag + seg (handles "your <b>Sedan</b>")
+    out = out.replace(
+      new RegExp(`\\b(Y|y)our (<[^>]+>)?(${seg}|${seg.toLowerCase()})(</[^>]+>)?\\b`, 'g'),
+      (_, cap, ot, _s, ct) => `${cap==='Y'?'The':'the'} ${ot||''}${m.nameplate}${ct||''}`
+    );
+    if(eng) out = out.replace(
+      new RegExp(`\\bthe ${eng} ${seg.toLowerCase()}\\b`, 'gi'),
+      `the ${m.nameplate}`
+    );
+  });
+  return out;
+}
+
+/* ── rival personalities ─────────────────────────────────────────────────── */
+const RIVAL_PERSONA = {
+  velo:  { tagline:'Volume play — cheap, lean, undercutting', trait:'undercuts on price' },
+  crown: { tagline:'Premium-first — brand-building, fat margins', trait:'holds premium pricing' },
+  nuvo:  { tagline:'Performance-obsessed — V8-heavy, efficiency gap', trait:'bets on performance engines' },
+};
+
+/* ── Motor1-style review card ────────────────────────────────────────────── */
+let _reviewDismissTimer = null;
+
+function buildReviewCard(m){
+  const seg = SEGS.find(s=>s.id===m.segId)||{name:m.segId,refPrice:25,spread:5,w:{}};
+  const eng = ENGINES[m.engId]||{name:m.engId,perf:0.4,eff:0.5,costAdd:0};
+  const trim = TRIMS[m.trimId]||{name:m.trimId,featAdd:0.1,priceAdd:0};
+  const w = seg.w||{};
+
+  // price position
+  const pDelta = (m.price - seg.refPrice) / seg.refPrice;
+  const pricePos = pDelta < -0.08 ? 'value' : pDelta > 0.12 ? 'premium' : 'competitive';
+
+  // verdict — three words covering price, powertrain, character
+  const priceWord = pricePos==='value' ? 'Affordable' : pricePos==='premium' ? 'Premium' : 'Competitive';
+  const engWord   = eng.perf>0.60 ? 'muscular' : eng.eff>0.72 ? 'efficient' : 'capable';
+  const charWord  = trim.featAdd>0.22 ? 'refined' : trim.featAdd>0.1 ? 'practical' : 'anonymous';
+  const verdict   = `"${priceWord}, ${engWord}, ${charWord}."`;
+
+  // strength / weakness — highest/lowest weighted score
+  const scored = [
+    { name:'price value', s:(w.price||0.2) * (1 - Math.max(0,(m.price-seg.refPrice)/(seg.refPrice+1))) },
+    { name:'efficiency',  s:(w.eff||0.1)  * eng.eff },
+    { name:'performance', s:(w.perf||0.1) * eng.perf },
+    { name:'features',    s:(w.feat||0.1) * (0.5 + trim.featAdd) },
+    { name:'brand fit',   s:(w.brand||0.1)* (st.companies.find(c=>c.player).brand) },
+  ].sort((a,b)=>b.s-a.s);
+  const strength = scored[0].name;
+  const weakness = scored[scored.length-1].name;
+
+  // projected buyer archetype
+  const buyerMap = {
+    sedan:  { value:'economy commuters', competitive:'family buyers', premium:'executive commuters' },
+    suv:    { value:'practical families', competitive:'active families', premium:'premium SUV buyers' },
+    pickup: { value:'budget haulers', competitive:'work truck drivers', premium:'lifestyle truck buyers' },
+    coupe:  { value:'young enthusiasts', competitive:'performance buyers', premium:'prestige collectors' },
+  };
+  const buyer = ((buyerMap[m.segId]||{})[pricePos]) || 'mainstream buyers';
+
+  // rival threat — highest-share rival in this segment
+  const shares = segShares(m.segId, st);
+  const topRival = st.companies.filter(c=>!c.player)
+    .map(c=>({ c, pct:Math.round(((shares[c.id]||{share:0}).share)*100) }))
+    .sort((a,b)=>b.pct-a.pct)[0];
+  const persona = topRival ? (RIVAL_PERSONA[topRival.c.id]||{trait:'holds share'}) : null;
+  const rivalLine = topRival && topRival.pct > 5
+    ? `${topRival.c.name} ${topRival.pct}% — ${persona.trait}`
+    : 'No dominant rival yet';
+
+  return { verdict, strength, weakness, buyer, rivalLine };
+}
+
+function showReviewCard(m){
+  if(!m || !m.nameplate) return;
+  const { verdict, strength, weakness, buyer, rivalLine } = buildReviewCard(m);
+  const seg = SEGS.find(s=>s.id===m.segId)||{name:m.segId};
+  const eng = ENGINES[m.engId]||{name:m.engId};
+  const trim = TRIMS[m.trimId]||{name:m.trimId};
+
+  const card = document.getElementById('reviewCard');
+  const overlay = document.getElementById('reviewOverlay');
+  if(!card||!overlay) return;
+
+  card.innerHTML = `
+    <div class="rv-brand">Motor1 Review · ${st.year}</div>
+    <div class="rv-name">${m.nameplate}</div>
+    <div class="rv-spec">${eng.name} ${seg.name} · ${trim.name} · $${m.price.toFixed(1)}k</div>
+    <div class="rv-verdict">${verdict}</div>
+    <div class="rv-row"><span class="rv-lbl">★ Strength</span><span class="rv-val">${strength}</span></div>
+    <div class="rv-row"><span class="rv-lbl">✗ Weakness</span><span class="rv-val">${weakness}</span></div>
+    <div class="rv-row"><span class="rv-lbl">Projects to</span><span class="rv-val">${buyer}</span></div>
+    <div class="rv-row"><span class="rv-lbl">Rival threat</span><span class="rv-val rv-rival">${rivalLine}</span></div>
+    <button class="rv-dismiss" onclick="dismissReviewCard()">Tap to dismiss</button>`;
+
+  overlay.style.display = 'block';
+  card.style.display = 'block';
+
+  if(_reviewDismissTimer) clearTimeout(_reviewDismissTimer);
+  _reviewDismissTimer = setTimeout(dismissReviewCard, 6000);
+}
+
+function dismissReviewCard(){
+  const card = document.getElementById('reviewCard');
+  const overlay = document.getElementById('reviewOverlay');
+  if(card) card.style.display = 'none';
+  if(overlay) overlay.style.display = 'none';
+  if(_reviewDismissTimer){ clearTimeout(_reviewDismissTimer); _reviewDismissTimer = null; }
+}
+
+/* ── floating feedback ────────────────────────────────────────────────────── */
+function showFloater(text, color){
+  color = color || 'var(--amber)';
+  const el = document.createElement('div');
+  el.className = 'floater';
+  el.style.color = color;
+  el.style.bottom = '90px';  // viewport-stable: above the advance button
+  el.textContent = text;
+  document.body.appendChild(el);
+  setTimeout(()=>el.remove(), 2300);
+}
+
+function floaterForBuildAction(actionType, obj){
+  if(!obj) return;
+  const CATALOG_DESC = {
+    assembly: { place:'Capacity +120k/q', upgrade:'Capacity +120k/q (now 240k/plant)' },
+    studio:   { place:'Model development unlocked', upgrade:'Refreshes 30% cheaper · novelty to 94%' },
+    rdlab:    { place:null, upgrade:null }, // dynamic — depends on focus
+  };
+  if(obj.type === 'rdlab'){
+    const focus = obj.labFocus || 'eng';
+    const branch = focus==='eng'?'Powertrain':focus==='eff'?'Reliability':'Manufacturing';
+    const bonus = actionType==='upgrade' ? '+$30M/q (total +$60M/q)' : '+$30M/q';
+    showFloater(`${branch} R&D ${bonus}`, 'var(--teal,#3B8EA5)');
+  } else {
+    const msg = (CATALOG_DESC[obj.type]||{})[actionType];
+    if(msg) showFloater(msg, obj.type==='studio'?'#7C6FD6':'var(--amber)');
+  }
+}
 
 /* ── save / load (A7) ─────────────────────────────────────────────────────── */
 function saveGame(){
@@ -1992,9 +2624,11 @@ function loadGame(){
     const data = JSON.parse(raw);
     if(!data || data.schemaVersion !== 4) return false;   // wrong schema → start fresh
     st = data.st;
+    ensureNameplates(st);
     if(typeof MarqueWorld!=='undefined') MarqueWorld.loadCampus(data.campus || null);
     studioSel = null; pendingFactory = false;
     if(st.difficulty) launchDiff = st.difficulty;
+    resetValuation();   // sparkline rebuilds across this session
     applyCampusToSim();
     _lastCash = st.companies.find(c=>c.player).cash;
     _lastShare = st.lastOverall*100;
@@ -2048,6 +2682,7 @@ function initCampus(){
       tt.style.top  = (rect.top+cy-28)+'px';
     },
     onInspectorUpdated: (selId) => updateInspectorPopup(selId),
+    onAction: (actionType, payload) => floaterForBuildAction(actionType, payload.obj),
   });
 }
 // arm the Design Studio build tool and bring the campus into view (the one-click
@@ -2056,6 +2691,24 @@ function armStudioBuild(){
   if(typeof MarqueWorld!=='undefined') MarqueWorld.toggleBuild('studio');
   const wv = document.getElementById('worldView');
   if(wv) wv.scrollIntoView({ behavior:'smooth', block:'center' });
+}
+function advisorAction(route){
+  if(!route) return;
+  const [type, param] = route.split(':');
+  if(type === 'plant'){
+    if(typeof MarqueWorld!=='undefined') MarqueWorld.toggleBuild('plant');
+    const wv = document.getElementById('worldView');
+    if(wv) wv.scrollIntoView({ behavior:'smooth', block:'center' });
+  } else if(type === 'redesign' || type === 'design'){
+    openStudio(param||null);
+  } else if(type === 'seg'){
+    const card = document.querySelector(`.seg-card[data-seg="${param}"]`);
+    if(card) card.scrollIntoView({ behavior:'smooth', block:'center' });
+  } else if(type === 'rd'){
+    setDashTab('rd');
+    const dt = document.getElementById('dashTabs');
+    if(dt) dt.scrollIntoView({ behavior:'smooth', block:'nearest' });
+  }
 }
 function refreshRunButtons(){
   const cont = document.getElementById('continueBtn');
@@ -2155,6 +2808,22 @@ function renderLaunchScreen(){
     </div>
 
     <div class="lnch-sec">
+      <div class="lnch-sec-lbl">Play mode</div>
+      <div class="lnch-opts">
+        <button class="lnch-btn eng-card${!launchSandbox?' sel':''}"
+          style="flex:1 1 46%;min-width:200px" onclick="setLaunchSandbox(false)">
+          <span class="en" style="font-size:12px">Campaign</span>
+          <span class="ec">Reach a goal by the deadline — win or time out</span>
+        </button>
+        <button class="lnch-btn eng-card${launchSandbox?' sel':''}"
+          style="flex:1 1 46%;min-width:200px" onclick="setLaunchSandbox(true)">
+          <span class="en" style="font-size:12px">Sandbox</span>
+          <span class="ec">Play forever · no win condition · no deadline</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="lnch-sec" id="lnchGoalRow" style="${launchSandbox?'opacity:.4;pointer-events:none':''}">
       <div class="lnch-sec-lbl">Victory goal</div>
       <div class="lnch-opts">
         ${Object.values(OBJECTIVES).map(o=>`<button class="lnch-btn eng-card${launchObjId===o.id?' sel':''}"
@@ -2220,6 +2889,10 @@ function setLaunchSel(segId, engId, trimId){
   renderLaunchScreen();
 }
 
+function setLaunchSandbox(val){
+  launchSandbox = val;
+  renderLaunchScreen();
+}
 function setLaunchObj(id){
   launchObjId = id;
   st.objective = makeObjective(id);
@@ -2231,11 +2904,17 @@ function confirmLaunch(){
   const pr = document.getElementById('lnchPr');
   const price = pr ? parseFloat(pr.value) : null;
   st.objective = makeObjective(launchObjId);
+  st.sandbox = launchSandbox;
   const result = playerDesign(st, launchSel.segId, launchSel.engId, launchSel.trimId, price);
   if(!result.ok){
     // shouldn't happen at launch (player always has enough cash) but guard
     alert(result.reason); return;
   }
+  ensureNameplates(st);
+  const newM = st.companies.find(c=>c.player).models.find(m=>m.segId===launchSel.segId&&m.active);
+  const isHalo = newM && newM.segId==='coupe' && (newM.engId==='V8'||newM.engId==='V12');
+  showFloater(isHalo ? `${newM.nameplate||'Coupe'} launched · halo brand boost active` : `${newM ? (newM.nameplate||launchSel.segId) : launchSel.segId} launched`, 'var(--green)');
+  if(newM) showReviewCard(newM);
   st.launchFlow = false;
   document.getElementById('launchOverlay').style.display = 'none';
   if(typeof MarqueWorld!=='undefined') MarqueWorld.setSimState(st);
@@ -2275,15 +2954,22 @@ function render(){
   renderSegments();
   renderRD();
   renderChart();
+  renderRivals();
   renderLog();
 
   const advWrap = document.querySelector('.advance');
   if(st.over){
     advWrap.innerHTML = renderEndScreen();
   } else {
-    advWrap.innerHTML = `<button id="advBtn" onclick="doAdvance()">Advance Quarter ▸</button>`;
+    const logHead = st.log && st.log[0];
+    const advisorNext = logHead && logHead.next;
+    const advisorRoute = logHead && logHead.nextRoute;
+    const advisorHtml = advisorNext
+      ? `<div class="advisor-card${advisorRoute ? ' actionable' : ''}"${advisorRoute ? ` onclick="advisorAction('${advisorRoute}')"` : ''}>${localizeHtml(advisorNext)}</div>` : '';
+    advWrap.innerHTML = `${advisorHtml}<button id="advBtn" onclick="doAdvance()">Advance Quarter ▸</button>`;
   }
   if(typeof MarqueWorld!=='undefined') MarqueWorld.renderPanels();
+  renderBroadcast();
 }
 
 /* ── segment cards ─────────────────────────────────────────────────────── */
@@ -2298,11 +2984,9 @@ function renderSegments(){
     const studioHere = hasStudio();
 
     const div = document.createElement('div');
-    div.className = 'seg';
-    let html = `<div class="seg-head">
-      <div class="seg-name">${s.name}</div>
-      <div class="seg-meta">${s.demand}k units/q · ref $${s.refPrice}k</div>
-    </div>`;
+    div.className = pm ? 'seg' : 'seg seg--empty';
+    div.dataset.seg = s.id;
+    let html;
 
     /* current model block */
     if(pm){
@@ -2314,10 +2998,14 @@ function renderSegments(){
       const floorPrice = +(pm.cost*1.02).toFixed(1);
       const ceilPrice  = +(s.refPrice*1.65).toFixed(1);
       const isHalo = pm.segId==='coupe' && (pm.engId==='V8'||pm.engId==='V12');
-      html += `<div class="model-row">
+      html = `<div class="seg-head">
+        <div class="seg-name">${s.name}</div>
+        <div class="seg-meta">${s.demand}k units/q · ref $${s.refPrice}k</div>
+      </div>
+      <div class="model-row">
         <div class="model-badge">
-          <div class="eng">${ENGINES[pm.engId].name}</div>
-          <div class="trm">${TRIMS[pm.trimId].name} · $${pm.cost}k/unit</div>
+          <div class="eng">${pm.nameplate || ENGINES[pm.engId].name}</div>
+          <div class="trm">${ENGINES[pm.engId].name} · ${TRIMS[pm.trimId].name} · $${pm.cost}k/unit</div>
           <div class="nov-bar"><i style="width:${nov}%;background:${novColor}"></i></div>
           <div class="nov-lbl">Novelty ${nov}%</div>
           ${pm.recallQ>0?`<span class="recall-badge">⚠ Recall (${pm.recallQ}q)</span>`:''}
@@ -2354,20 +3042,15 @@ function renderSegments(){
       </div>`;
     } else {
       const isNewSeg = !(player.launchedSegs && player.launchedSegs[s.id]);
-      const toolNote = isNewSeg
-        ? `<span style="color:var(--red)">Entering ${s.name} needs <b>$${C.segmentLaunchCost}M</b> in plant tooling, on top of the design.</span>`
-        : `You've tooled ${s.name} before — re-entry is just the design cost.`;
-      if(studioHere){
-        html += `<div class="no-model">No model in this segment. ${toolNote}</div>`;
-        html += `<div class="seg-actions">
-          <button class="btn primary" onclick="openStudio('${s.id}')">Develop in Studio ▸</button>
-        </div>`;
-      } else {
-        html += `<div class="no-model locked">No model yet. <b>Build a Design Studio</b> to develop new models. ${toolNote}</div>`;
-        html += `<div class="seg-actions">
-          <button class="btn primary" onclick="armStudioBuild()">+ Build a Design Studio</button>
-        </div>`;
-      }
+      const toolCost = isNewSeg ? ` · $${C.segmentLaunchCost}M to enter` : ' · tooled, re-entry';
+      const enterBtn = studioHere
+        ? `<button class="btn" style="padding:3px 10px;font-size:11px" onclick="openStudio('${s.id}')">Enter ▸</button>`
+        : `<button class="btn" style="padding:3px 10px;font-size:11px" onclick="armStudioBuild()">+ Studio first</button>`;
+      html = `<div class="seg-head">
+        <div class="seg-name">${s.name}</div>
+        <div class="seg-meta">${s.demand}k units/q · ref $${s.refPrice}k${toolCost}</div>
+        ${enterBtn}
+      </div>`;
     }
 
     /* competitor share bar */
@@ -2562,10 +3245,198 @@ function renderChart(){
   ).join('');
 }
 
+/* ── rival personality cards (Market tab) ──────────────────────────── */
+function renderRivals(){
+  const el = document.getElementById('rivalCards');
+  if(!el) return;
+  const rivals = st.companies.filter(c=>!c.player);
+  el.innerHTML = rivals.map(c=>{
+    const p = RIVAL_PERSONA[c.id]||{tagline:'',trait:''};
+    const share = Math.round((c.lastShareOverall||0)*100);
+    const models = c.models.filter(m=>m.active);
+    const statLine = models.length
+      ? models.map(m=>{
+          const sn = getSeg(m.segId).name;
+          const eng = ENGINES[m.engId]||{name:m.engId};
+          return `${sn} ${eng.name} $${m.price.toFixed(0)}k`;
+        }).join(' &middot; ')
+      : 'No active models';
+    return `<div class="rival-card">
+      <div class="rival-dot" style="background:${c.hex}"></div>
+      <div style="flex:1;min-width:0">
+        <div class="rival-name" style="color:${c.hex}">${c.name}</div>
+        <div class="rival-tag">${p.tagline.toUpperCase()}</div>
+        <div class="rival-stats"><b>${share}%</b> share &nbsp;&middot;&nbsp; ${statLine}</div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+/* ── live broadcast layer: ticker + scoreboard + valuation (Tasks 3-5) ──────
+   All PRESENTATION. These functions read sim state and never mutate it. The
+   ticker scrolls and the valuation jitters on their own rAF loop so the world
+   stays visibly "live" between quarters; real repricing happens only on Advance. */
+
+// Derived company valuation ("share price"): a sensible blend of cash, overall
+// share, brand, and recent share momentum. Pure read of state.
+function companyValuation(state){
+  state = state || st;
+  const player = state.companies && state.companies.find(c=>c.player);
+  if(!player) return 0;
+  const sharePct = (state.lastOverall||0)*100;
+  const brand = player.brand*100;
+  const cash = player.cash;
+  let mom = 0;
+  const h = state.history;
+  if(h && h.length>=2) mom = ((h[h.length-1]['you']||0) - (h[h.length-2]['you']||0))*100;
+  const price = 12 + cash*0.02 + sharePct*1.7 + brand*0.35 + mom*5;
+  return Math.max(1, price);
+}
+
+// per-run valuation history (shell-local, presentation only — not in the sim save)
+let valHist = [];
+function recordValuation(){ valHist.push(companyValuation(st)); if(valHist.length>24) valHist.shift(); }
+function resetValuation(){ valHist = []; }
+
+// share trend for a company vs the previous quarter (from sim history)
+function shareTrend(coId){
+  const h = st.history; if(!h || h.length<2) return 0;
+  return (h[h.length-1][coId]||0) - (h[h.length-2][coId]||0);
+}
+function arrowSpan(delta, eps){ eps = eps||0.002;
+  if(delta >  eps) return '<span class="tk-up">▲</span>';
+  if(delta < -eps) return '<span class="tk-down">▼</span>';
+  return '<span class="tk-flat">·</span>';
+}
+
+// a short, in-character "latest move" for a rival, derived from their lineup
+function rivalTopModel(co){
+  let best=null; (co.models||[]).filter(m=>m.active).forEach(m=>{ if(!best||(m.lastShare||0)>(best.lastShare||0)) best=m; });
+  return best;
+}
+function rivalMoveText(co){
+  const persona = RIVAL_PERSONA[co.id]||{trait:'holding position'};
+  const m = rivalTopModel(co);
+  if(!m) return persona.trait;
+  const seg = getSeg(m.segId).name;
+  const eng = (ENGINES[m.engId]||{name:m.engId}).name;
+  const price = m.price!=null ? '$'+m.price.toFixed(0)+'k' : '';
+  if(co.id==='velo')  return `Undercutting ${seg} at ${price}`;
+  if(co.id==='crown') return `Holding premium ${seg}, ${price}`;
+  if(co.id==='nuvo')  return `Pushing ${eng} ${seg}, ${price}`;
+  return `Leads with ${seg} ${eng}`;
+}
+
+// build the rotating ticker item set from real state
+function tickerData(){
+  const items = [];
+  const player = st.companies.find(c=>c.player);
+  const val = companyValuation(st);
+  const prevVal = valHist.length>=2 ? valHist[valHist.length-2] : val;
+  const vd = val - prevVal, vpct = prevVal ? vd/prevVal*100 : 0;
+  items.push({cls:'tk-stock', html:`<span class="tk-k">MRQE</span> <span class="tk-v tk-stock-val">$${val.toFixed(2)}</span> ${arrowSpan(vd,0.01)} <span class="${vd>=0?'tk-up':'tk-down'}">${vd>=0?'+':''}${vpct.toFixed(1)}%</span>`});
+  items.push({cls:'', html:`<span class="tk-k">Your Share</span> <span class="tk-v">${((st.lastOverall||0)*100).toFixed(1)}%</span> ${arrowSpan(shareTrend('you'))}`});
+  items.push({cls:'', html:`<span class="tk-k">Brand</span> <span class="tk-v">${Math.round(player.brand*100)}</span>`});
+  if(st.tick>0){ const p=st.lastProfit; items.push({cls:'', html:`<span class="tk-k">Last Q</span> <span class="${p>=0?'tk-up':'tk-down'}">${p>=0?'+':'-'}$${Math.abs(Math.round(p))}M</span>`}); }
+  st.companies.filter(c=>!c.player).forEach(co=>{
+    items.push({cls:'', html:`<span class="tk-k" style="color:${co.hex}">${co.name}</span> <span class="tk-v">${Math.round((co.lastShareOverall||0)*100)}%</span> ${arrowSpan(shareTrend(co.id))} <span style="color:var(--dimmer)">${rivalMoveText(co)}</span>`});
+  });
+  (player.models||[]).filter(m=>m.active&&m.recallQ>0).forEach(m=>{
+    items.push({cls:'', html:`<span class="tk-recall">⚠ RECALL</span> <span style="color:var(--dim)">${getSeg(m.segId).name} defect — brand &amp; cash hit</span>`});
+  });
+  if(st.lastEvents && st.lastEvents.length){
+    const txt = String(st.lastEvents[st.lastEvents.length-1]).replace(/<[^>]+>/g,'');
+    if(txt.trim()) items.push({cls:'', html:`<span class="tk-k">News</span> <span style="color:var(--dim)">${txt}</span>`});
+  }
+  return items;
+}
+
+let tickerX=0, tickerHalf=0, tickerBaseVal=0;
+function buildTicker(){
+  const track = document.getElementById('tickerTrack'); if(!track) return;
+  const one = tickerData().map(it=>`<span class="tk-item ${it.cls}">${it.html}</span>`).join('');
+  track.innerHTML = one + one;     // two identical copies → seamless wrap
+  tickerHalf = 0;                  // force recompute on next frame
+}
+
+function renderScoreboard(){
+  const el = document.getElementById('worldScoreboard'); if(!el) return;
+  if(!st || st.launchFlow){ el.style.display='none'; return; }
+  el.style.display='block';
+  const rivals = st.companies.filter(c=>!c.player);
+  el.innerHTML = `<div class="wsb-title">The Field · Q${st.quarter} ${st.year}</div>` + rivals.map(co=>{
+    const persona = RIVAL_PERSONA[co.id]||{trait:''};
+    return `<div class="wsb-rival">
+      <div class="wsb-head">
+        <span class="wsb-dot" style="background:${co.hex}"></span>
+        <span class="wsb-name">${co.name}</span><span class="wsb-tag">${(persona.trait||'').split(' ')[0]}</span>
+        <span class="wsb-share" style="color:${co.hex}">${Math.round((co.lastShareOverall||0)*100)}% ${arrowSpan(shareTrend(co.id))}</span>
+      </div>
+      <div class="wsb-move">${rivalMoveText(co)}</div>
+    </div>`;
+  }).join('');
+}
+
+function sparkline(arr){
+  const w=120,h=22;
+  if(!arr || arr.length<2) return `<svg class="wv-spark" width="${w}" height="${h}"></svg>`;
+  const n=arr.length, min=Math.min(...arr), max=Math.max(...arr), rng=(max-min)||1;
+  const pts=arr.map((v,i)=>`${(i/(n-1)*w).toFixed(1)},${(h-((v-min)/rng)*h).toFixed(1)}`).join(' ');
+  const up=arr[n-1]>=arr[0];
+  return `<svg class="wv-spark" width="${w}" height="${h}"><polyline points="${pts}" fill="none" stroke="${up?'var(--green)':'var(--red)'}" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/></svg>`;
+}
+function renderValuation(){
+  const el = document.getElementById('worldValuation'); if(!el) return;
+  if(!st || st.launchFlow){ el.style.display='none'; return; }
+  el.style.display='block';
+  const val = companyValuation(st);
+  const prev = valHist.length>=2 ? valHist[valHist.length-2] : val;
+  const d = val - prev, pct = prev ? d/prev*100 : 0, cls = d>=0?'tk-up':'tk-down';
+  el.innerHTML = `<div class="wv-k">Marque Valuation</div>
+    <div><span class="wv-price" id="wvPrice">$${val.toFixed(2)}</span><span class="wv-trend ${cls}">${d>=0?'▲':'▼'} ${Math.abs(pct).toFixed(1)}%</span></div>
+    <div class="wv-sub">per share · ${valHist.length} q tracked</div>
+    ${sparkline(valHist)}`;
+}
+
+// rebuild the whole broadcast layer (called from render(), i.e. after each Advance)
+function renderBroadcast(){
+  const band = document.getElementById('tickerBand');
+  if(!st || st.launchFlow || st.over){ if(band) band.style.display='none'; renderScoreboard(); renderValuation(); return; }
+  if(valHist.length===0) recordValuation();   // seed first point at game start
+  if(band) band.style.display='flex';
+  tickerBaseVal = companyValuation(st);
+  buildTicker();
+  renderScoreboard();
+  renderValuation();
+}
+
+// continuous rAF loop: scrolls the ticker and jitters the valuation between
+// quarters so the world feels live even when the player isn't advancing.
+let broadcastStarted=false, lastBroadcastTs=0;
+function startBroadcast(){ if(broadcastStarted) return; broadcastStarted=true; requestAnimationFrame(broadcastLoop); }
+function broadcastLoop(ts){
+  if(!lastBroadcastTs) lastBroadcastTs=ts;
+  const dt = Math.min((ts-lastBroadcastTs)/1000, 0.05); lastBroadcastTs=ts;
+  const track = document.getElementById('tickerTrack');
+  if(track && st && !st.launchFlow && !st.over){
+    if(tickerHalf<=0) tickerHalf = track.scrollWidth/2;
+    tickerX -= 42*dt;
+    if(tickerHalf>0 && tickerX <= -tickerHalf) tickerX += tickerHalf;
+    track.style.transform = `translateX(${tickerX}px)`;
+    if(tickerBaseVal>0){
+      const jit = tickerBaseVal*(1+(Math.random()-0.5)*0.004);
+      const txt = '$'+jit.toFixed(2);
+      document.querySelectorAll('.tk-stock-val').forEach(s=>{ s.textContent=txt; });
+      const wp = document.getElementById('wvPrice'); if(wp) wp.textContent=txt;
+    }
+  }
+  requestAnimationFrame(broadcastLoop);
+}
+
 /* ── log ─────────────────────────────────────────────────────────────── */
 function renderLog(){
   document.getElementById('log').innerHTML = st.log.map(e=>
-    `<div class="e"><span class="q">${e.label}</span>${e.html}</div>`
+    `<div class="e"><span class="q">${e.label}</span>${localizeHtml(e.html)}</div>`
   ).join('');
 }
 
@@ -2604,6 +3475,11 @@ function studioConfirm(){
   if(!studioSel) return;
   const result = playerDesign(st, studioSel.segId, studioSel.engId, studioSel.trimId);
   if(!result.ok){ alert(result.reason); return; }
+  ensureNameplates(st);
+  const dm = st.companies.find(c=>c.player).models.find(m=>m.segId===studioSel.segId&&m.active);
+  const dHalo = dm && dm.segId==='coupe' && (dm.engId==='V8'||dm.engId==='V12');
+  showFloater(dHalo ? `${dm.nameplate||'Coupe'} redesigned · halo active` : `${dm ? (dm.nameplate||studioSel.segId) : studioSel.segId} redesigned`, 'var(--green)');
+  if(dm) showReviewCard(dm);
   studioSel = null;
   document.getElementById('studioOverlay').style.display = 'none';
   if(typeof MarqueWorld!=='undefined') MarqueWorld.renderPanels();
@@ -2697,6 +3573,8 @@ function doRefresh(segId){
   const s = SEGS.find(x=>x.id===segId);
   const result = playerRefresh(st, segId);   // sim deducts the full base cost
   if(!result.ok){ alert(result.reason); return; }
+  const rm = st.companies.find(c=>c.player).models.find(m=>m.segId===segId&&m.active);
+  showFloater(`${rm ? (rm.nameplate||s.name) : s.name} refreshed · novelty restored`, 'var(--green)');
   if(studioLevel()>=2){
     // L2 perk 1: refund the 30% cost discount shell-side (sim stays untouched)
     const credit = result.cost - refreshCostFor(s);
@@ -2714,21 +3592,84 @@ function doRetire(segId){
   render();
   saveGame();
 }
+/* Prepends a player-specific dramatic opener to the Q1 and Q2 log entries.
+   Runs after advance() so all share/profit data is live. Shell-only. */
+function dramatizeEarlyLog(st){
+  if(st.tick > 2) return;
+  const p = st.companies.find(c=>c.player);
+  const fm = p.models.find(m=>m.active);
+  if(!fm) return;
+  const seg = getSeg(fm.segId);
+  const name = fm.nameplate || ENGINES[fm.engId].name;
+  const segShrs = segShares(fm.segId, st);
+  const myShare = segShrs['you'] ? Math.round(segShrs['you'].share*100) : 0;
+  const rivals = Object.entries(segShrs).filter(([k])=>k!=='you').sort((a,b)=>b[1].share-a[1].share);
+  const topRival = rivals[0];
+  const entry = st.log[0];  // log uses unshift: newest is at index 0
+  if(!entry) return;
+
+  let opener;
+  if(st.tick===1){
+    const rvText = topRival
+      ? ` <b>${st.companies.find(c=>c.id===topRival[0])?.name||'A rival'}</b> leads with ${Math.round(topRival[1].share*100)}%.`
+      : '';
+    opener = `<b>The ${name} is in market.</b> `
+      + (myShare > 0
+        ? `${myShare}% of ${seg.name} buyers chose you at $${fm.price.toFixed(1)}k.`
+        : `Your ${seg.name} is live — first revenue incoming.`)
+      + rvText;
+  } else {
+    const prev = st.history.length>=2 ? (st.history[st.history.length-2]['you']||0) : 0;
+    const cur  = st.lastOverall;
+    const diff = Math.round((cur-prev)*100*10)/10;
+    if(diff > 0.3){
+      opener = `<b>The ${name} is gaining ground</b> — share climbed ${diff.toFixed(1)} pts. Rivals are adjusting prices.`;
+    } else if(diff < -0.3){
+      opener = `<b>The ${name} lost ground</b> — share slipped ${Math.abs(diff).toFixed(1)} pts. Time to respond.`;
+    } else {
+      opener = `<b>The ${name} holds steady</b> — ${Math.round(cur*100)}% overall share. The field is watching.`;
+    }
+  }
+  entry.html = opener + ' ' + entry.html;
+}
+
 function doAdvance(){
   try {
     applyCampusToSim();   // input hook: campus-derived capacity feeds the sim
-    // campus R&D Lab adds to all three R&D branches this quarter
-    const campusRD = (typeof MarqueWorld!=='undefined')
-      ? MarqueWorld.deriveCampusInputs(MarqueWorld.getCampus()).rdBonuses
-      : {};
+    // campus buildings add R&D bonuses and other effects each quarter
+    const campusInputs = (typeof MarqueWorld!=='undefined')
+      ? MarqueWorld.deriveCampusInputs(MarqueWorld.getCampus())
+      : { rdBonuses:{eng:0,eff:0,mfg:0}, qualityCenter:{warrantyCash:0}, testTrackLevel:0 };
+    const campusRD = campusInputs.rdBonuses || {};
     advance(st, { rd:{ eng: pendingRD.eng + (campusRD.eng||0),
                        eff: pendingRD.eff + (campusRD.eff||0),
                        mfg: pendingRD.mfg + (campusRD.mfg||0) },
                   factoryUpgrade:false });
+    // Sandbox mode: never end on win or timeout (only bankrupt can end)
+    if(st.sandbox && st.over && st.overReason !== 'bankrupt'){
+      st.over = false; st.won = false; st.overReason = null;
+    }
+    // Quality Center warranty: partial recall cost coverage, applied post-advance
+    const wc = campusInputs.qualityCenter && campusInputs.qualityCenter.warrantyCash;
+    if(wc && st.lastEvents && st.lastEvents.some(e=>e.includes('Recall'))){
+      const player = st.companies.find(c=>c.player);
+      player.cash += wc;
+      if(st.log[0]) st.log[0].html += ` <span style="color:var(--green)">Quality Center covered $${wc}M of recall costs.</span>`;
+    }
+    // Test Track L2 amplifies coupe halo: apply extra brand bump post-advance
+    if(campusInputs.testTrackLevel >= 2 && st.lastHaloBonus > 0){
+      const player = st.companies.find(c=>c.player);
+      const extra = 0.005;
+      player.brand = Math.min(1, player.brand + extra);
+      if(st.log[0]) st.log[0].html += ` <span style="color:var(--amber)">Test Track amplified your coupe halo (+${Math.round(extra*100)} brand).</span>`;
+    }
+    dramatizeEarlyLog(st);
     studioSel=null;
+    recordValuation();   // reprice the company for real this quarter (ticker/sparkline)
     if(typeof MarqueWorld!=='undefined') MarqueWorld.setSimState(st);
     if(typeof MarqueWorld!=='undefined'){
       MarqueWorld.applyProduction(MarqueWorld.getCampus(), st.lastUnits);
+      MarqueWorld.triggerBurst();
       MarqueWorld.renderPanels();
     }
     render();
@@ -2739,13 +3680,18 @@ function doAdvance(){
   }
 }
 function renderGoalBanner(){
+  const el = document.getElementById('goalBanner');
+  if(st.sandbox){
+    el.innerHTML = `<span style="color:var(--dim);font-family:var(--mono);font-size:11px">SANDBOX — no victory condition · play forever</span>`;
+    return;
+  }
   const obj = st.objective;
   const stat = objectiveStatus(st);
   const deadline = (obj.deadlineYear - C.startYear)*4 + obj.deadlineQuarter;
   const current  = (st.year - C.startYear)*4 + st.quarter;
   const qleft = Math.max(0, deadline - current);
   const color = stat.met ? 'var(--green)' : (qleft <= 4 ? 'var(--red)' : 'var(--amber)');
-  document.getElementById('goalBanner').innerHTML =
+  el.innerHTML =
     `Goal — <b style="color:var(--hi)">${stat.name}</b> by Q${obj.deadlineQuarter}&nbsp;${obj.deadlineYear}`
     + ` &nbsp;·&nbsp; <span style="color:${color}">${stat.detail}</span>`
     + ` &nbsp;·&nbsp; ${qleft} quarter${qleft!==1?'s':''} left`;
@@ -2758,6 +3704,7 @@ function renderEndScreen(){
   const cls = reason==='win'?'win':reason==='bankrupt'?'bankrupt':'timeout';
   const objName = (OBJECTIVES[obj.id]||OBJECTIVES.share).name;
   const headline = reason==='win' ? 'Goal achieved.' : reason==='bankrupt' ? 'Insolvent.' : 'Time\'s up.';
+  const diffLabel = (st.difficulty && DIFFICULTY[st.difficulty]) ? ` · ${DIFFICULTY[st.difficulty].label}` : '';
   const sub = reason==='win'
     ? `You completed ${objName}${diffLabel} by Q${st.quarter} ${st.year}.`
     : reason==='bankrupt'
@@ -2765,14 +3712,17 @@ function renderEndScreen(){
     : `Deadline reached without completing ${objName}${diffLabel}.`;
   const headColor = reason==='win'?'var(--green)':reason==='bankrupt'?'var(--red)':'var(--dim)';
   const keepBtn = st.won ? `<button onclick="keepBuilding()">Keep building →</button>` : '';
-  const diffLabel = (st.difficulty && DIFFICULTY[st.difficulty]) ? ` · ${DIFFICULTY[st.difficulty].label}` : '';
   const recap = endRecap(st);
+  const bestSellerNameplate = recap.bestSeller ? (() => {
+    const p2 = player; const bm = p2.models.find(m=>m.nameplate && getSeg(m.segId).name===recap.bestSeller.label.split(' ').pop());
+    return bm ? bm.nameplate : recap.bestSeller.label;
+  })() : null;
   const bestSellerVal = recap.bestSeller
-    ? `${recap.bestSeller.label} <small style="color:var(--dim)">${(recap.bestSeller.units/1000).toFixed(2)}M</small>` : '—';
+    ? `${bestSellerNameplate} <small style="color:var(--dim)">${(recap.bestSeller.units/1000).toFixed(2)}M</small>` : '—';
   return `<div class="endcard ${cls}">
     <h3 style="color:${headColor}">${headline}</h3>
     <div class="sub">${sub}</div>
-    <div class="endstory">“${recap.story}”</div>
+    <div class="endstory">"${localizeHtml(recap.story)}"</div>
     <div class="score-val">${st.score.toLocaleString()}<small>score</small></div>
     <div class="stat-grid">
       <div><div class="sk">Final share</div><div class="sv">${(st.lastOverall*100).toFixed(1)}%</div></div>
@@ -2782,7 +3732,7 @@ function renderEndScreen(){
       <div><div class="sk">Brand</div><div class="sv">${Math.round(player.brand*100)}</div></div>
       <div><div class="sk">Best-seller</div><div class="sv" style="font-size:12px">${bestSellerVal}</div></div>
     </div>
-    <div class="enddecisive"><span>Decisive factor</span> ${recap.decisive}.</div>
+    <div class="enddecisive"><span>Decisive factor</span> ${localizeHtml(recap.decisive)}.</div>
     <div class="end-actions">
       <button class="primary-end" onclick="startNew()">Play again</button>
       ${keepBtn}
@@ -2835,16 +3785,20 @@ function buildResultText(){
   const outcome = reason==='win'?'WIN':reason==='bankrupt'?'BANKRUPT':'TIMEOUT';
   const recap = endRecap(st);
   const peakPct = (st.peakShare*100).toFixed(1);
-  const best = recap.bestSeller
-    ? `${recap.bestSeller.label} (${(recap.bestSeller.units/1000).toFixed(1)}M units)` : '—';
+  const bestLabel = recap.bestSeller ? (() => {
+    const bm = player.models.find(m=>m.nameplate && getSeg(m.segId).name===recap.bestSeller.label.split(' ').pop());
+    return bm ? bm.nameplate : recap.bestSeller.label;
+  })() : null;
+  const best = bestLabel ? `${bestLabel} (${(recap.bestSeller.units/1000).toFixed(1)}M units)` : '—';
   const diffLabel = (st.difficulty && DIFFICULTY[st.difficulty])
     ? ' · '+DIFFICULTY[st.difficulty].label : '';
+  const plain = h => h.replace(/<[^>]+>/g,'');
   return [
     `MARQUE · ${player.name} · ${obj.name}${diffLabel}`,
     `${outcome} in Q${st.quarter} ${st.year} · Peak share ${peakPct}%`,
     `Best-seller: ${best}`,
-    `${recap.decisive}.`,
-    `"${recap.story}"`,
+    `${plain(localizeHtml(recap.decisive))}.`,
+    `"${plain(localizeHtml(recap.story))}"`,
   ].join('\n');
 }
 function copyResult(){
@@ -2860,7 +3814,7 @@ let launchDiff = 'standard';
 const DIFFICULTY = {
   relaxed:  { label:'Relaxed',  startCash:600, shareTarget:0.28, desc:'More cash · 28% share goal' },
   standard: { label:'Standard', startCash:450, shareTarget:0.33, desc:'Balanced · 33% share goal' },
-  hard:     { label:'Hard',     startCash:300, shareTarget:0.38, desc:'Tight budget · 38% share goal' },
+  hard:     { label:'Hard',     startCash:380, shareTarget:0.37, desc:'Lean budget · 37% share goal' },
 };
 function applyDifficulty(state, diff){
   const d = DIFFICULTY[diff] || DIFFICULTY.standard;
@@ -2884,6 +3838,7 @@ function startNew(){
   st=newGame();
   applyDifficulty(st, launchDiff);
   if(typeof MarqueWorld!=='undefined') MarqueWorld.resetCampus();
+  resetValuation();
   applyCampusToSim();
   render();
 }
@@ -2892,6 +3847,7 @@ function startNew(){
 initCampus();
 if(!loadGame()) startNew();
 refreshRunButtons();
+startBroadcast();   // begin the continuous live ticker / valuation loop
 
 document.getElementById('newRunBtn').onclick = () => {
   if(st && !st.over && !st.launchFlow &&
