@@ -21,11 +21,11 @@ const MarqueSim = (() => {
 // multi-year financial commitment — so cash compounds slowly and the share
 // goal is earned by out-developing rivals over time, not by mere presence.
 const C = {
-  startYear: 1990, startCash: 400,
+  startYear: 1990, startCash: 450,   // +50M runway so 1st 6q aren't a cash hole
   // operating costs — overhead is no longer a flat fee; it grows with the
   // company so a sprawling, high-capacity automaker carries real burden.
   overheadBase: 40,          // $M/q fixed corporate cost
-  overheadPerModel: 30,      // $M/q per active model (engineering, marketing)
+  overheadPerModel: 26,      // $M/q per active model (was 30 — saves ~$4–12M/q early)
   capacityCarry: 0.20,       // $M/q per k-unit of standing capacity
   noveltyDecay: 0.90,
   designBase: 30,            // $M + engine/trim adders (was 16 — tooling is real)
@@ -1526,6 +1526,24 @@ return { init, update, step, getState, setViewSpeed, setNight, setFocus };
  * which is the one campus input the sim actually consumes this build.
  */
 
+/* marque-world.js — MARQUE campus builder (PART B, v2 architecture slice)
+ *
+ * The WORLD owns campus state: an isometric grid of placed buildings, selection,
+ * placement, and rendering. It never runs the economy and never mutates sim
+ * internals. The only thing it hands the economy is a derived input bundle via
+ * deriveCampusInputs(); the shell applies that to the sim at quarter advance.
+ *
+ * Money: the world never touches sim state. To pay for a build it asks the shell
+ * through the onSpend() callback (which deducts player cash and returns success).
+ *
+ * Headless-safe: all campus logic is pure functions over a plain campus object,
+ * and step(dt) is decoupled from requestAnimationFrame, so the campus can be
+ * tested and stepped without a DOM (rAF is frozen in hidden tabs).
+ *
+ * Tonight's catalog: the Assembly Plant only. Its level sets production capacity,
+ * which is the one campus input the sim actually consumes this build.
+ */
+
 window.MarqueWorld = (() => {
 'use strict';
 
@@ -1551,6 +1569,18 @@ const CATALOG = {
       null,
       { placeCost:140, h:0.8 },     // L1 — one project at a time, normal cost
       { upgradeCost:150, h:1.2 },   // L2 — cheaper refreshes (shell applies the perk)
+    ],
+  },
+  // The R&D Lab boosts Powertrain research (quality + recall risk reduction).
+  // It feeds the sim via rdBonuses.eng in deriveCampusInputs; the shell adds
+  // that bonus to the player's quarterly Powertrain R&D spend before advance().
+  // Sim is untouched — it just receives a larger rd.eng value.
+  rdlab: {
+    type:'rdlab', name:'R&D Lab', w:3, d:2, maxLevel:2, color:'#3B8EA5',
+    levels: [
+      null,
+      { placeCost:180, h:0.85 },   // L1 — +30M/q Powertrain R&D equivalent
+      { upgradeCost:160, h:1.25 }, // L2 — +60M/q Powertrain R&D equivalent
     ],
   },
 };
@@ -1590,17 +1620,23 @@ function capacityOf(o){
   return (o.type==='assembly' && o.state==='operating') ? def(o.type).levels[o.level].capacity : 0;
 }
 
-// THE ADAPTER (B4): campus state → sim inputs. Only `capacity` is consumed by the
-// sim tonight; the rest are placeholders kept so future buildings can feed them.
+// THE ADAPTER (B4): campus state → sim inputs. `capacity` and `rdBonuses` (all three
+// branches) are consumed by the shell; the rest are placeholders for future buildings.
 function deriveCampusInputs(campus){
   let capacity = BASE_CAPACITY;
   let studioPresent = false, studioLevel = 0;
+  const rdBonuses = { eng:0, eff:0, mfg:0 };
   campus.objects.forEach(o => {
     capacity += capacityOf(o);
     if(o.type==='studio'){ studioPresent = true; if(o.level>studioLevel) studioLevel = o.level; }
+    if(o.type==='rdlab'){
+      const bonus = (o.level >= 2 ? 60 : 30);
+      const focus = o.labFocus || 'eng';
+      rdBonuses[focus] = (rdBonuses[focus]||0) + bonus;
+    }
   });
   return { capacity, designStudio:{ present:studioPresent, level:studioLevel },
-           rdBonuses:{}, segmentUnlocks:[], brandBonus:0, manufacturingBonus:0 };
+           rdBonuses, segmentUnlocks:[], brandBonus:0, manufacturingBonus:0 };
 }
 
 // mutating ops — pure over (campus, cash). cashSpentOnCampus is a campus-local
@@ -1611,6 +1647,7 @@ function place(campus, type, x, y, cash){
   const cost = placeCostOf(type);
   if(cash < cost)                     return { ok:false, reason:'Not enough cash.' };
   const o = { id:campus.nextId++, type, x, y, level:1, state:'operating', lastOutput:0 };
+  if(type==='rdlab') o.labFocus = 'eng';   // default focus: Powertrain
   campus.objects.push(o);
   campus.cashSpentOnCampus += cost;
   return { ok:true, cost, id:o.id };
@@ -1924,9 +1961,12 @@ function renderPanels(){
   renderMenu();
   renderInspector();
 }
-const BUILDABLE = ['assembly','studio'];
+const BUILDABLE = ['assembly','studio','rdlab'];
 function renderMenu(){
   if(!opts.menuEl) return;
+  // armed state: highlight the campus tile area so new players know WHERE to click
+  const campusEl = opts.menuEl.closest ? opts.menuEl.closest('.campus') : null;
+  if(campusEl) campusEl.classList.toggle('campus-armed', !!buildType);
   const cash = opts.getCash? Math.round(opts.getCash()):0;
   const inputs = deriveCampusInputs(campus);
   const studio = inputs.designStudio;
@@ -1947,13 +1987,48 @@ function renderInspector(){
   if(!opts.inspectorEl) return;
   const o = campus.objects.find(x=>x.id===campus.selectedId);
   if(!o){ opts.inspectorEl.innerHTML = `<div class="winsp-empty">Select a building to inspect it.</div>`; return; }
+  if(o.type==='rdlab'){
+    const d=def(o.type);
+    const upCost=upgradeCostOf(o);
+    const cash = opts.getCash? opts.getCash():0;
+    const canUp = upCost!=null && cash>=upCost;
+    const bonus = o.level>=2 ? 60 : 30;
+    const focus = o.labFocus || 'eng';
+    const focusLabels = { eng:'Powertrain', eff:'Reliability', mfg:'Manufacturing' };
+    const focusEffects = { eng:'Quality ↑ · recall risk ↓', eff:'Efficiency bonus ↑', mfg:'Unit cost ↓' };
+    const focusBtns = ['eng','eff','mfg'].map(k=>
+      `<button class="btn${focus===k?' primary':''}" style="padding:5px 9px;font-size:10px"
+         onclick="MarqueWorld.setLabFocus(${o.id},'${k}')">${focusLabels[k]}</button>`
+    ).join('');
+    opts.inspectorEl.innerHTML =
+      `<div class="winsp-name">${d.name} <span class="winsp-lvl">Level ${o.level}</span></div>
+       <div class="winsp-grid">
+         <div><span class="wk">R&D boost</span><span class="wv">+$${bonus}M/q</span></div>
+         <div><span class="wk">Focus</span><span class="wv" style="color:var(--amber)">${focusLabels[focus]}</span></div>
+         <div><span class="wk">Effect</span><span class="wv" style="font-size:11px">${focusEffects[focus]}</span></div>
+         <div><span class="wk">Footprint</span><span class="wv">${d.w}×${d.d}</span></div>
+       </div>
+       <div style="margin-bottom:12px">
+         <div style="font-family:var(--mono);font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);margin-bottom:5px">Allocate focus:</div>
+         <div style="display:flex;gap:6px">${focusBtns}</div>
+       </div>
+       <div class="winsp-actions">
+         ${upCost!=null
+           ? `<button class="btn primary" ${canUp?'':'disabled'} onclick="MarqueWorld.upgradeSelected()">Upgrade to L${o.level+1} · $${upCost}M</button>`
+           : `<button class="btn" disabled>Max level</button>`}
+         <button class="btn danger" onclick="MarqueWorld.demolishSelected()">Demolish</button>
+       </div>`;
+    return;
+  }
   if(o.type==='studio'){
     const d=def(o.type);
     const upCost=upgradeCostOf(o);
     const cash = opts.getCash? opts.getCash():0;
     const canUp = upCost!=null && cash>=upCost;
     const status = (opts.getStudioStatus && opts.getStudioStatus()) || 'Idle';
-    const perk = o.level>=2 ? 'Refreshes cost 30% less' : 'L2 makes refreshes 30% cheaper';
+    const perk = o.level>=2
+      ? 'Refreshes 30% cheaper · novelty restores to 94%'
+      : 'Upgrade for 30% off refreshes + stronger novelty restore';
     opts.inspectorEl.innerHTML =
       `<div class="winsp-name">${d.name} <span class="winsp-lvl">Level ${o.level}</span></div>
        <div class="winsp-grid">
@@ -2011,6 +2086,13 @@ function demolishSelected(){
   if(res.ok) changed(); else flash(res.reason);
 }
 function studioAction(){ if(opts.onStudioOpen) opts.onStudioOpen(); }
+function setLabFocus(id, focus){
+  const o = campus.objects.find(o=>o.id===id);
+  if(!o || o.type!=='rdlab') return;
+  if(!['eng','eff','mfg'].includes(focus)) return;
+  o.labFocus = focus;
+  changed();
+}
 
 // ── lifecycle ────────────────────────────────────────────────────────────────
 function step(dt){
@@ -2068,7 +2150,7 @@ return {
   CATALOG, GRID_W, GRID_D, BASE_CAPACITY,
   // lifecycle / shell wiring
   init, getCampus, loadCampus, resetCampus, step, render, renderPanels,
-  toggleBuild, upgradeSelected, demolishSelected, studioAction,
+  toggleBuild, upgradeSelected, demolishSelected, studioAction, setLabFocus,
 };
 
 })();
@@ -2158,20 +2240,6 @@ return {
   .cars svg{width:18px;height:9px;opacity:.9}
   .cars .units{font-family:var(--mono);font-size:10px;color:var(--dim);margin-left:6px}
 
-  /* ── design picker ── */
-  .design-picker{background:var(--bg);border:1px solid var(--amber);border-radius:8px;padding:13px;margin-top:10px}
-  .pk-lbl{font-family:var(--mono);font-size:9px;letter-spacing:.18em;text-transform:uppercase;color:var(--dim);margin-bottom:5px}
-  .pk-row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
-  .pk-btn{font-family:var(--mono);font-size:11px;background:var(--panel2);color:var(--dim);
-    border:1px solid var(--line);border-radius:6px;padding:5px 9px;cursor:pointer;transition:.12s}
-  .pk-btn:hover{color:var(--hi);border-color:rgba(255,255,255,.2)}
-  .pk-btn.sel{background:var(--amber);color:#10141C;border-color:var(--amber);font-weight:600}
-  .pk-btn:disabled{opacity:.3;cursor:not-allowed;pointer-events:none}
-  .pk-eng-detail{font-family:var(--mono);font-size:10px;color:var(--dim);margin-bottom:8px}
-  .pk-eng-detail b{color:var(--hi)}
-  .design-cost-line{font-family:var(--mono);font-size:11px;color:var(--dim);margin-bottom:10px;padding:7px 9px;background:var(--panel2);border-radius:6px}
-  .design-cost-line b{color:var(--amber)}
-  .pk-actions{display:flex;gap:6px}
 
   /* ── share bar ── */
   .sharebar{display:flex;height:7px;border-radius:4px;overflow:hidden;margin-top:12px;background:var(--bg)}
@@ -2290,8 +2358,20 @@ return {
   .winsp-note{font-family:var(--mono);font-size:9px;color:var(--dimmer);margin-top:9px;letter-spacing:.04em}
 
   /* ── factory hero ── */
-  .factory-hero{position:relative;width:100%;height:280px;border-radius:12px;
-    overflow:hidden;background:#0C0F15;margin-bottom:18px;border:1px solid var(--line)}
+  .factory-hero{position:relative;width:100%;height:160px;border-radius:12px;
+    overflow:hidden;background:#0C0F15;margin-bottom:10px;border:1px solid var(--line)}
+  .factory-readout-lbl{position:absolute;top:8px;left:12px;font-family:var(--mono);
+    font-size:9px;letter-spacing:.18em;text-transform:uppercase;color:var(--dimmer);
+    z-index:2;pointer-events:none}
+
+  /* ── campus section heading ── */
+  .campus-hdr{display:flex;align-items:baseline;gap:12px;margin-bottom:5px}
+  .campus-hdr-title{font-size:14px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;color:var(--hi)}
+  .campus-hdr-sub{font-family:var(--mono);font-size:10px;color:var(--dim)}
+  .campus-hint{font-family:var(--mono);font-size:10px;color:var(--dimmer);padding:0 0 9px;letter-spacing:.03em}
+  /* armed state: glow the grid so new players know THAT is where they click */
+  .campus.campus-armed .campus-grid{border-color:rgba(242,163,60,.65)!important;
+    box-shadow:0 0 0 3px rgba(242,163,60,.18)}
   #factoryCanvas{position:absolute;inset:0;width:100%;height:100%;display:block}
   .factory-hud{position:absolute;bottom:0;left:0;right:0;
     display:flex;justify-content:space-between;align-items:center;
@@ -2345,6 +2425,22 @@ return {
     border:none;border-radius:10px;padding:14px;cursor:pointer;
     box-shadow:0 4px 18px rgba(242,163,60,.28);margin-top:6px}
   .lnch-launch-btn:hover{filter:brightness(1.06)}
+
+  /* ── tutorial card ── */
+  #tutCard{position:fixed;bottom:80px;right:18px;z-index:50;
+    background:var(--panel);border:1px solid rgba(242,163,60,.4);border-radius:10px;
+    padding:12px 14px;min-width:196px;font-family:var(--mono);font-size:10px;
+    box-shadow:0 4px 16px rgba(0,0,0,.4);transition:opacity .35s}
+  #tutCard.tut-fading{opacity:0;pointer-events:none}
+  .tut-head{display:flex;justify-content:space-between;align-items:center;
+    font-weight:600;letter-spacing:.1em;text-transform:uppercase;font-size:9px;
+    color:var(--amber);margin-bottom:8px}
+  .tut-dismiss{background:none;border:none;color:var(--dimmer);cursor:pointer;
+    font-size:14px;padding:0;line-height:1}
+  .tut-dismiss:hover{color:var(--hi)}
+  .tut-item{display:flex;gap:7px;align-items:baseline;padding:2px 0;color:var(--dim)}
+  .tut-item.tut-done{color:var(--green)}
+  .tut-check{flex-shrink:0}
 </style>
 </head>
 <body>
@@ -2360,8 +2456,9 @@ return {
   </div>
   <div class="cluster" id="cluster"></div>
 </header>
-<!-- factory hero — always visible, live readout of sim state -->
+<!-- factory hero — always visible, live readout of sim state; read-only, not the build surface -->
 <div class="factory-hero">
+  <div class="factory-readout-lbl">Factory Line · readout</div>
   <canvas id="factoryCanvas"></canvas>
   <div class="factory-hud">
     <div class="fhud-stat" id="fhudStat">—</div>
@@ -2378,11 +2475,14 @@ return {
     </div>
   </div>
 </div>
-<!-- campus builder (PART B): the hero above is the plant interior; this is the
-     plant site you place and tool. Plant capacity feeds the sim each quarter. -->
-<div class="campus">
+<!-- campus builder: the primary build surface. Click a build button, then a tile. -->
+<div class="campus-hdr">
+  <span class="campus-hdr-title">Plant Campus</span>
+  <span class="campus-hdr-sub">Buildings here set factory capacity each quarter</span>
+</div>
+<div class="campus-hint">Click a build button, then click a tile here to place.</div>
+<div class="campus" id="campusArea">
   <div class="campus-grid">
-    <div class="campus-title">Plant Campus</div>
     <canvas id="worldCanvas"></canvas>
   </div>
   <div class="campus-side">
@@ -2429,6 +2529,8 @@ return {
 <div id="launchOverlay"></div>
 <!-- Design Studio overlay — the in-game car-design flow, opened from the studio building -->
 <div id="studioOverlay"></div>
+<!-- first-run tutorial checklist — dismissible, localStorage-persisted -->
+<div id="tutCard" style="display:none"></div>
 
 <script>
 /* ── global state ─────────────────────────────────────────────────────────── */
@@ -2439,7 +2541,7 @@ let studioSel = null;   // { segId, engId, trimId } while a design is in progres
 let launchSel = { segId:'sedan', engId:'I4', trimId:'mid' };
 let launchObjId = 'share';
 let _lastCash = 0, _lastShare = 0, _lastBrand = 0;
-const SAVE_KEY = 'marque.save.v3';
+const SAVE_KEY = 'marque.save.v4';
 
 const { newGame, advance, segShares, playerDesign, playerRefresh, playerRetire,
         quoteDesign, objectiveStatus, makeObjective, OBJECTIVES, endRecap,
@@ -2449,7 +2551,7 @@ const { newGame, advance, segShares, playerDesign, playerRefresh, playerRetire,
 function saveGame(){
   try {
     const campus = (typeof MarqueWorld!=='undefined') ? MarqueWorld.getCampus() : null;
-    localStorage.setItem(SAVE_KEY, JSON.stringify({ st, campus }));
+    localStorage.setItem(SAVE_KEY, JSON.stringify({ st, campus, schemaVersion:4 }));
   } catch(e){}
   refreshRunButtons();
 }
@@ -2459,9 +2561,11 @@ function loadGame(){
     const raw = localStorage.getItem(SAVE_KEY);
     if(!raw) return false;
     const data = JSON.parse(raw);
-    st = data && data.st ? data.st : data;        // tolerate older saves (st only)
-    if(typeof MarqueWorld!=='undefined') MarqueWorld.loadCampus(data && data.campus ? data.campus : null);
+    if(!data || data.schemaVersion !== 4) return false;   // wrong schema → start fresh
+    st = data.st;
+    if(typeof MarqueWorld!=='undefined') MarqueWorld.loadCampus(data.campus || null);
     studioSel = null; pendingFactory = false;
+    if(st.difficulty) launchDiff = st.difficulty;
     applyCampusToSim();
     _lastCash = st.companies.find(c=>c.player).cash;
     _lastShare = st.lastOverall*100;
@@ -2469,7 +2573,7 @@ function loadGame(){
     MarqueFactory.update(st, { hasRecall:false });
     render();
     return true;
-  } catch(e){ return false; }
+  } catch(e){ console.error('loadGame error', e); return false; }
 }
 
 /* ── campus ↔ sim bridge (PART B, the explicit input hook) ─────────────────── */
@@ -2556,7 +2660,18 @@ function renderLaunchScreen(){
 
   ov.innerHTML = `<div class="launch-card">
     <div class="launch-title">Found your automaker · 1990</div>
-    <div class="launch-sub">Pick a victory goal, then design your first car</div>
+    <div class="launch-sub">Pick a difficulty &amp; goal, then design your first car</div>
+
+    <div class="lnch-sec">
+      <div class="lnch-sec-lbl">Difficulty</div>
+      <div class="lnch-opts">
+        ${Object.entries(DIFFICULTY).map(([id,d])=>`<button class="lnch-btn eng-card${launchDiff===id?' sel':''}"
+          style="flex:1 1 28%;min-width:110px" onclick="setDifficulty('${id}')">
+          <span class="en" style="font-size:13px">${d.label}</span>
+          <span class="ec">${d.desc}</span>
+        </button>`).join('')}
+      </div>
+    </div>
 
     <div class="lnch-sec">
       <div class="lnch-sec-lbl">Victory goal</div>
@@ -2627,6 +2742,7 @@ function setLaunchSel(segId, engId, trimId){
 function setLaunchObj(id){
   launchObjId = id;
   st.objective = makeObjective(id);
+  applyDifficulty(st, launchDiff);   // re-apply: objective change resets targetShare
   renderLaunchScreen();
 }
 
@@ -2648,6 +2764,7 @@ function confirmLaunch(){
 
 /* ── render ─────────────────────────────────────────────────────────────── */
 function render(){
+  updateTutorial();
   if(st.launchFlow){ renderLaunchScreen(); return; }
 
   const player = st.companies.find(c=>c.player);
@@ -2842,8 +2959,14 @@ function renderSegments(){
 }
 
 /* ── R&D ──────────────────────────────────────────────────────────────── */
+function rdLabBonuses(){
+  if(typeof MarqueWorld==='undefined') return { eng:0, eff:0, mfg:0 };
+  const b = MarqueWorld.deriveCampusInputs(MarqueWorld.getCampus()).rdBonuses;
+  return { eng:b.eng||0, eff:b.eff||0, mfg:b.mfg||0 };
+}
 function renderRD(){
   const player = st.companies.find(c=>c.player);
+  const labBonuses = rdLabBonuses();
   const branches = [
     { k:'eng', name:'Powertrain',
       sub:'performance + quality · reduces recall risk',
@@ -2877,6 +3000,9 @@ function renderRD(){
   branches.forEach(b => {
     const div = document.createElement('div'); div.className = 'rd';
     const pct = Math.round(b.pct()*100);
+    const branchBonus = labBonuses[b.k] || 0;
+    const labLine = branchBonus>0
+      ? `<div class="rd-effect" style="color:var(--green)">+$${branchBonus}M/q from R&D Lab</div>` : '';
     div.innerHTML = `
       <div class="row">
         <span class="k">${b.name}<small>${b.sub}</small></span>
@@ -2884,17 +3010,26 @@ function renderRD(){
       </div>
       <input type="range" id="rds-${b.k}" min="0" max="130" step="5" value="${pendingRD[b.k]}">
       <div class="statbar"><i style="width:${pct}%"></i></div>
-      <div class="rd-effect">${b.effect()}</div>`;
+      <div class="rd-effect">${b.effect()}</div>${labLine}`;
     wrap.appendChild(div);
     div.querySelector(`#rds-${b.k}`).addEventListener('input', e => {
       pendingRD[b.k] = parseInt(e.target.value);
       document.getElementById(`rdv-${b.k}`).textContent = `$${pendingRD[b.k]}M`;
       const el = document.getElementById('rdtot');
-      if(el) el.textContent = `$${pendingRD.eng+pendingRD.eff+pendingRD.mfg}M`;
+      if(el){
+        const manual = pendingRD.eng+pendingRD.eff+pendingRD.mfg;
+        const totalLab = labBonuses.eng+labBonuses.eff+labBonuses.mfg;
+        el.textContent = `$${manual+totalLab}M`;
+      }
     });
   });
   const tot = document.createElement('div'); tot.className = 'rd-total';
-  tot.innerHTML = `<span class="dim">Total this quarter</span><b id="rdtot">$${pendingRD.eng+pendingRD.eff+pendingRD.mfg}M</b>`;
+  const rdManual = pendingRD.eng+pendingRD.eff+pendingRD.mfg;
+  const totalLabBonus = labBonuses.eng+labBonuses.eff+labBonuses.mfg;
+  const rdGrandTotal = rdManual + totalLabBonus;
+  tot.innerHTML = `<span class="dim">Total this quarter</span>`
+    + `<b id="rdtot">$${rdGrandTotal}M</b>`
+    + (totalLabBonus>0 ? `<span class="dim" style="font-size:10px;margin-left:8px">($${rdManual}M manual + $${totalLabBonus}M lab)</span>` : '');
   wrap.appendChild(tot);
 }
 
@@ -3024,8 +3159,8 @@ function renderStudioOverlay(){
   const player = st.companies.find(c=>c.player);
   const lvl = studioLevel();
   const perk = lvl>=2
-    ? `<span style="color:var(--green)">Level 2 · refreshes cost 30% less</span>`
-    : `<span class="dim">Level 1 · upgrade the Studio for cheaper refreshes</span>`;
+    ? `<span style="color:var(--green)">Level 2 · refreshes 30% cheaper + restore to 94% novelty</span>`
+    : `<span class="dim">Level 1 · upgrade the Studio for 30% off refreshes + stronger novelty restore</span>`;
 
   // segment chooser — always shown; the picked segment expands the engine/trim/price form
   const segCards = SEGS.map(sg=>{
@@ -3104,10 +3239,13 @@ function doRefresh(segId){
   const s = SEGS.find(x=>x.id===segId);
   const result = playerRefresh(st, segId);   // sim deducts the full base cost
   if(!result.ok){ alert(result.reason); return; }
-  // Design Studio L2 perk: refund the discount shell-side (sim stays untouched)
   if(studioLevel()>=2){
+    // L2 perk 1: refund the 30% cost discount shell-side (sim stays untouched)
     const credit = result.cost - refreshCostFor(s);
     if(credit>0) st.companies.find(c=>c.player).cash += credit;
+    // L2 perk 2: restore novelty to 94% instead of sim's default 86%
+    const m = st.companies.find(c=>c.player).models.find(m=>m.segId===segId&&m.active);
+    if(m) m.novelty = 0.94;
   }
   render();
   saveGame();
@@ -3119,19 +3257,31 @@ function doRetire(segId){
   saveGame();
 }
 function doAdvance(){
-  applyCampusToSim();   // input hook: campus-derived capacity feeds the sim
-  advance(st, { rd:{...pendingRD}, factoryUpgrade:false });
-  studioSel=null;
-  // detect recall (recallQ === recallDuration means it just fired this quarter)
-  const player = st.companies.find(c=>c.player);
-  const hasRecall = player.models.some(m => m.active && m.recallQ === C.recallDuration);
-  MarqueFactory.update(st, { hasRecall });
-  if(typeof MarqueWorld!=='undefined'){
-    MarqueWorld.applyProduction(MarqueWorld.getCampus(), st.lastUnits);  // plant utilization readout
-    MarqueWorld.renderPanels();
+  try {
+    applyCampusToSim();   // input hook: campus-derived capacity feeds the sim
+    // campus R&D Lab adds to all three R&D branches this quarter
+    const campusRD = (typeof MarqueWorld!=='undefined')
+      ? MarqueWorld.deriveCampusInputs(MarqueWorld.getCampus()).rdBonuses
+      : {};
+    advance(st, { rd:{ eng: pendingRD.eng + (campusRD.eng||0),
+                       eff: pendingRD.eff + (campusRD.eff||0),
+                       mfg: pendingRD.mfg + (campusRD.mfg||0) },
+                  factoryUpgrade:false });
+    studioSel=null;
+    // detect recall (recallQ === recallDuration means it just fired this quarter)
+    const player = st.companies.find(c=>c.player);
+    const hasRecall = player.models.some(m => m.active && m.recallQ === C.recallDuration);
+    MarqueFactory.update(st, { hasRecall });
+    if(typeof MarqueWorld!=='undefined'){
+      MarqueWorld.applyProduction(MarqueWorld.getCampus(), st.lastUnits);
+      MarqueWorld.renderPanels();
+    }
+    render();
+    saveGame();
+  } catch(e){
+    console.error('Advance error:', e);
+    alert('Something went wrong advancing the quarter. Try refreshing. Details: '+e.message);
   }
-  render();
-  saveGame();
 }
 function renderGoalBanner(){
   const obj = st.objective;
@@ -3154,12 +3304,13 @@ function renderEndScreen(){
   const objName = (OBJECTIVES[obj.id]||OBJECTIVES.share).name;
   const headline = reason==='win' ? 'Goal achieved.' : reason==='bankrupt' ? 'Insolvent.' : 'Time\'s up.';
   const sub = reason==='win'
-    ? `You completed ${objName} by Q${st.quarter} ${st.year}.`
+    ? `You completed ${objName}${diffLabel} by Q${st.quarter} ${st.year}.`
     : reason==='bankrupt'
-    ? `Cash hit zero in Q${st.quarter} ${st.year}. The board wound the company down.`
-    : `Deadline reached without completing ${objName}.`;
+    ? `Cash hit zero in Q${st.quarter} ${st.year}${diffLabel}. The board wound the company down.`
+    : `Deadline reached without completing ${objName}${diffLabel}.`;
   const headColor = reason==='win'?'var(--green)':reason==='bankrupt'?'var(--red)':'var(--dim)';
   const keepBtn = st.won ? `<button onclick="keepBuilding()">Keep building →</button>` : '';
+  const diffLabel = (st.difficulty && DIFFICULTY[st.difficulty]) ? ` · ${DIFFICULTY[st.difficulty].label}` : '';
   const recap = endRecap(st);
   const bestSellerVal = recap.bestSeller
     ? `${recap.bestSeller.label} <small style="color:var(--dim)">${(recap.bestSeller.units/1000).toFixed(2)}M</small>` : '—';
@@ -3180,11 +3331,94 @@ function renderEndScreen(){
     <div class="end-actions">
       <button class="primary-end" onclick="startNew()">Play again</button>
       ${keepBtn}
+      <button id="copyResultBtn" onclick="copyResult()">Copy result</button>
     </div>
   </div>`;
 }
 
 function keepBuilding(){ st.over = false; render(); saveGame(); }
+
+/* ── tutorial checklist ─────────────────────────────────────────────────── */
+const TUTORIAL_KEY = 'marque.tutorial.v1';
+const TUTORIAL_STEPS = [
+  { label:'Design your founding car',
+    check: ()=> st && !st.launchFlow },
+  { label:'Place a Design Studio',
+    check: ()=> hasStudio() },
+  { label:'Build an R&D Lab',
+    check: ()=> typeof MarqueWorld!=='undefined' &&
+                MarqueWorld.getCampus().objects.some(o=>o.type==='rdlab') },
+  { label:'Advance your first quarter',
+    check: ()=> st && st.tick >= 1 },
+];
+function isTutDismissed(){ try{ return !!localStorage.getItem(TUTORIAL_KEY); }catch(e){ return false; } }
+function dismissTutorial(){
+  try{ localStorage.setItem(TUTORIAL_KEY,'1'); }catch(e){}
+  const el=document.getElementById('tutCard');
+  if(el){ el.classList.add('tut-fading'); setTimeout(()=>{ el.style.display='none'; el.classList.remove('tut-fading'); },380); }
+}
+function updateTutorial(){
+  if(isTutDismissed()) return;
+  const el=document.getElementById('tutCard');
+  if(!el || !st) return;
+  const allDone = TUTORIAL_STEPS.every(s=>s.check());
+  if(allDone){ setTimeout(dismissTutorial, 1100); return; }
+  const items = TUTORIAL_STEPS.map(s=>{
+    const done=s.check();
+    return `<div class="tut-item${done?' tut-done':''}"><span class="tut-check">${done?'✓':'○'}</span>${s.label}</div>`;
+  }).join('');
+  el.style.display='block';
+  el.innerHTML=`<div class="tut-head">Getting started
+    <button class="tut-dismiss" onclick="dismissTutorial()" title="Dismiss">✕</button></div>${items}`;
+}
+
+/* ── end-of-run result card ─────────────────────────────────────────────── */
+function buildResultText(){
+  const player = st.companies.find(c=>c.player);
+  const obj = OBJECTIVES[(st.objective&&st.objective.id)] || OBJECTIVES.share;
+  const reason = st.overReason;
+  const outcome = reason==='win'?'WIN':reason==='bankrupt'?'BANKRUPT':'TIMEOUT';
+  const recap = endRecap(st);
+  const peakPct = (st.peakShare*100).toFixed(1);
+  const best = recap.bestSeller
+    ? `${recap.bestSeller.label} (${(recap.bestSeller.units/1000).toFixed(1)}M units)` : '—';
+  const diffLabel = (st.difficulty && DIFFICULTY[st.difficulty])
+    ? ' · '+DIFFICULTY[st.difficulty].label : '';
+  return [
+    `MARQUE · ${player.name} · ${obj.name}${diffLabel}`,
+    `${outcome} in Q${st.quarter} ${st.year} · Peak share ${peakPct}%`,
+    `Best-seller: ${best}`,
+    `${recap.decisive}.`,
+    `"${recap.story}"`,
+  ].join('\n');
+}
+function copyResult(){
+  const text = buildResultText();
+  navigator.clipboard.writeText(text).then(()=>{
+    const btn=document.getElementById('copyResultBtn');
+    if(btn){ btn.textContent='Copied!'; setTimeout(()=>{ btn.textContent='Copy result'; },2000); }
+  }).catch(()=>{ prompt('Copy this result:', text); });
+}
+
+/* ── difficulty ─────────────────────────────────────────────────────────── */
+let launchDiff = 'standard';
+const DIFFICULTY = {
+  relaxed:  { label:'Relaxed',  startCash:600, shareTarget:0.28, desc:'More cash · 28% share goal' },
+  standard: { label:'Standard', startCash:450, shareTarget:0.33, desc:'Balanced · 33% share goal' },
+  hard:     { label:'Hard',     startCash:300, shareTarget:0.38, desc:'Tight budget · 38% share goal' },
+};
+function applyDifficulty(state, diff){
+  const d = DIFFICULTY[diff] || DIFFICULTY.standard;
+  const player = state.companies.find(c=>c.player);
+  player.cash = d.startCash;
+  if(state.objective && state.objective.targetShare != null) state.objective.targetShare = d.shareTarget;
+  state.difficulty = diff;
+}
+function setDifficulty(id){
+  launchDiff = id;
+  applyDifficulty(st, id);
+  renderLaunchScreen();
+}
 
 function startNew(){
   studioSel=null; pendingFactory=false;
@@ -3193,6 +3427,7 @@ function startNew(){
   launchSel={ segId:'sedan', engId:'I4', trimId:'mid' };
   launchObjId='share';
   st=newGame();
+  applyDifficulty(st, launchDiff);
   if(typeof MarqueWorld!=='undefined') MarqueWorld.resetCampus();
   applyCampusToSim();
   render();
