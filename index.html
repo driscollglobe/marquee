@@ -848,684 +848,8 @@ return { newGame, advance, segShares, playerDesign, playerRefresh, playerRetire,
          quoteDesign, objectiveStatus, objectiveMet, makeObjective, OBJECTIVES, endRecap,
          SEGS, ENGINES, TRIMS, C };
 })();
-
 </script>
 <script>
-/* marque-factory.js — animated isometric factory, MARQUE Phase 2
- *
- * Architecture: pure readout of sim state. Data flows sim → factory ONLY.
- * This file never writes to sim state. Keep factory rendering logic separable.
- *
- * API:
- *   MarqueFactory.init(canvasEl)        — attach canvas, start rAF loop
- *   MarqueFactory.update(st, extras)    — call after advance(); reads new sim state
- *                                         extras = { hasRecall: bool }
- *   MarqueFactory.setViewSpeed(n)       — player speed toggle: 0.5 | 1 | 2
- *   MarqueFactory.setNight(bool)        — player day/night toggle
- *
- * Sim state read (never written):
- *   st.lastUnits     → conveyor speed + lot fill
- *   player.models    → active bodystyle + engine badge on line cars
- *   st.lastProfit    → scene health tint (mood overlay)
- *   extras.hasRecall → triggers recall tow-back visual
- */
-
-window.MarqueFactory = (() => {
-'use strict';
-
-// ── canvas ─────────────────────────────────────────────────────────────────
-let cv, ctx, W = 0, H = 0, DPR = 1;
-
-function resize(){
-  DPR = Math.min(window.devicePixelRatio || 1, 2);
-  W   = cv.clientWidth;
-  H   = cv.clientHeight;
-  cv.width  = W * DPR;
-  cv.height = H * DPR;
-  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-}
-
-// ── isometric projection ───────────────────────────────────────────────────
-const TW = 58, TH = 29, ZS = 21;
-let view = { ox:0, oy:0, sc:1 };
-
-function fit(){
-  // tuned for wide short hero band (e.g. 1200 × 280px)
-  view.sc = Math.min(W / 700, H / 340);
-  view.sc = Math.max(0.50, Math.min(view.sc, 1.4));
-  view.ox  = W * 0.35;
-  view.oy  = H * 0.23;
-}
-
-function iso(x, y, z){
-  const hw = TW/2, hh = TH/2;
-  return {
-    x: view.ox + (x - y) * hw * view.sc,
-    y: view.oy + (x + y) * hh * view.sc - (z||0) * ZS * view.sc,
-  };
-}
-const S = () => view.sc;
-
-// ── color utils ────────────────────────────────────────────────────────────
-const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
-function shade(hex, amt){
-  const n = parseInt(hex.slice(1), 16);
-  const r = clamp(((n>>16)&255) + amt, 0, 255)|0;
-  const g = clamp(((n>>8 )&255) + amt, 0, 255)|0;
-  const b = clamp(((n    )&255) + amt, 0, 255)|0;
-  return `rgb(${r},${g},${b})`;
-}
-
-// ── primitives ─────────────────────────────────────────────────────────────
-function tile(x, y, fill, stroke){
-  const a=iso(x,y,0), b=iso(x+1,y,0), c=iso(x+1,y+1,0), d=iso(x,y+1,0);
-  ctx.beginPath();
-  ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.lineTo(c.x,c.y); ctx.lineTo(d.x,d.y);
-  ctx.closePath();
-  ctx.fillStyle = fill; ctx.fill();
-  if(stroke){ ctx.strokeStyle = stroke; ctx.lineWidth = 1; ctx.stroke(); }
-}
-
-function box(x, y, z, w, d, h, col, opt){
-  opt = opt || {};
-  const top = col, right = shade(col,-26), left = shade(col,-52);
-  const p = (X,Y,Z) => iso(X,Y,Z);
-  let A,B,C,D;
-  // right face (+x)
-  A=p(x+w,y,z); B=p(x+w,y+d,z); C=p(x+w,y+d,z+h); D=p(x+w,y,z+h);
-  ctx.fillStyle = opt.right || right; quad(A,B,C,D);
-  // left face (+y)
-  A=p(x,y+d,z); B=p(x+w,y+d,z); C=p(x+w,y+d,z+h); D=p(x,y+d,z+h);
-  ctx.fillStyle = opt.left || left; quad(A,B,C,D);
-  // top face
-  A=p(x,y,z+h); B=p(x+w,y,z+h); C=p(x+w,y+d,z+h); D=p(x,y+d,z+h);
-  ctx.fillStyle = opt.top || top; quad(A,B,C,D);
-  if(opt.outline){ ctx.strokeStyle = opt.outline; ctx.lineWidth = 1; ctx.stroke(); }
-}
-
-function quad(a, b, c, d){
-  ctx.beginPath();
-  ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.lineTo(c.x,c.y); ctx.lineTo(d.x,d.y);
-  ctx.closePath(); ctx.fill();
-}
-
-function isoLine(x1, y1, x2, y2, z, col, wd){
-  const a = iso(x1,y1,z), b = iso(x2,y2,z);
-  ctx.strokeStyle = col; ctx.lineWidth = wd||1;
-  ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
-}
-
-// ── world constants ────────────────────────────────────────────────────────
-const LX = 2.6, LY0 = 0.7, LY1 = 6.4, PZ = 0.42, WELD_Y = 4.0;
-
-const SLOTS = [];
-for(let sy=1.2; sy<=5.2; sy+=1.3)
-  for(let sx=8.4; sx<=11.6; sx+=1.4)
-    SLOTS.push({ x:sx, y:sy, car:null });
-
-// per-bodystyle color palette (matches segment identity)
-const BS_COLORS = {
-  sedan:'#E8584B', suv:'#3F8EE0', pickup:'#46B97A', coupe:'#8E6BD8',
-};
-
-// per-bodystyle shape params: lm=length mult, wm=width mult, bH=body height,
-// cabRat=cabin fraction of length, cabH=cabin height, ride=z offset,
-// bed=true for pickup open-bed drawing
-const BS_SHAPES = {
-  sedan:  { lm:1.00, wm:1.00, bH:0.18, cabRat:0.50, cabH:0.16, ride:0.00 },
-  suv:    { lm:1.06, wm:1.08, bH:0.22, cabRat:0.62, cabH:0.19, ride:0.05 },
-  pickup: { lm:1.12, wm:1.04, bH:0.14, cabRat:0.38, cabH:0.15, ride:0.06, bed:true },
-  coupe:  { lm:0.97, wm:1.00, bH:0.14, cabRat:0.54, cabH:0.11, ride:0.00 },
-};
-
-// ── sim signal snapshot ────────────────────────────────────────────────────
-// Updated by .update() after each advance(). Never written by factory code.
-let simSignals = {
-  lineSpeed:  1.0,    // conveyor speed multiplier from st.lastUnits
-  lotTarget:  3,      // target number of parked cars from last quarter's sales
-  bodystyle:  'sedan',
-  modelColor: '#E8584B',
-  engId:      'I4',
-  healthTint: 0,      // -1 (struggling) … +1 (thriving)
-};
-let pendingRecall = false;  // true until next car graduation handles the visual
-
-// ── world state ────────────────────────────────────────────────────────────
-let fT = 0, viewSpeed = 1, night = false;
-let lineCars = [], roadCars = [], smoke = [], sparks = [], clouds = [];
-let spawnTimer = 0;
-
-const workers = [
-  { type:'idle',   x:LX-0.9,  y:2.2,    ph:Math.random()*6 },
-  { type:'idle',   x:LX+0.9,  y:3.2,    ph:Math.random()*6 },
-  { type:'idle',   x:LX-0.9,  y:5.0,    ph:Math.random()*6 },
-  { type:'idle',   x:LX+0.95, y:WELD_Y, ph:Math.random()*6 },
-  { type:'patrol', wp:[{x:0.8,y:1},{x:0.8,y:6},{x:4.4,y:6},{x:4.4,y:1}],
-    i:0, x:0.8, y:1, ph:0, sp:0.55 },
-  { type:'patrol', wp:[{x:4.6,y:6.8},{x:8,y:6.8},{x:8,y:5.5},{x:4.6,y:5.5}],
-    i:0, x:4.6, y:6.8, ph:0, sp:0.5 },
-];
-
-const forklift = {
-  wp:[{x:0.6,y:0.6},{x:LX-0.2,y:0.9},{x:LX-0.2,y:0.9},{x:0.6,y:0.6}],
-  i:0, x:0.6, y:0.6, carry:true, sp:0.7, vx:0, vy:0, ph:0,
-};
-
-for(let i=0; i<5; i++)
-  clouds.push({ x:Math.random(), y:0.05+Math.random()*0.12,
-                s:0.6+Math.random()*0.8, sp:0.004+Math.random()*0.006 });
-
-function primeLineCars(){
-  for(let k=0; k<5; k++)
-    lineCars.push({ y:LY0+k*1.1, color:simSignals.modelColor,
-                    bs:simSignals.bodystyle, vy:1 });
-}
-
-// ── helpers ────────────────────────────────────────────────────────────────
-function getEffSpeed(){ return Math.max(0.25, viewSpeed * simSignals.lineSpeed); }
-function freeSlot(){ return SLOTS.find(s => !s.car); }
-function stageForY(y){ if(y<2.0) return 1; if(y<3.4) return 2; if(y<5.0) return 3; return 4; }
-
-// ── update ─────────────────────────────────────────────────────────────────
-function updateWorld(dt){
-  const eff = getEffSpeed();
-  fT += dt;
-
-  // spawn new cars
-  spawnTimer -= dt * eff;
-  if(spawnTimer <= 0){
-    lineCars.push({ y:LY0, color:simSignals.modelColor,
-                    bs:simSignals.bodystyle, vy:1 });
-    spawnTimer = 2.6;
-  }
-
-  // move line cars
-  for(const c of lineCars) c.y += 0.85 * eff * dt;
-
-  // graduate finished cars
-  for(let i=lineCars.length-1; i>=0; i--){
-    if(lineCars[i].y < LY1) continue;
-    const c = lineCars.splice(i, 1)[0];
-
-    if(pendingRecall){
-      // recall visual: car drives out then U-turns back into plant
-      roadCars.push({
-        x:LX, y:6.6, color:'#E5605E', bs:c.bs,
-        path:[{x:LX,y:7.1},{x:LX,y:7.5},{x:5.0,y:7.5},{x:LX,y:7.5},{x:LX,y:LY1+0.1}],
-        pi:0, slot:null, parked:false, vx:0, vy:1, isRecall:true,
-      });
-      pendingRecall = false;
-    } else {
-      const slot = freeSlot();
-      const path = slot
-        ? [{x:LX,y:6.9},{x:LX,y:7.3},{x:8.0,y:7.3},{x:slot.x,y:7.3},{x:slot.x,y:slot.y}]
-        : [{x:LX,y:6.9},{x:LX,y:7.3},{x:13.5,y:7.3},{x:13.5,y:11}];
-      if(slot) slot.car = true;
-      roadCars.push({
-        x:LX, y:6.6, color:c.color, bs:c.bs,
-        path, pi:0, slot, parked:false, vx:0, vy:1,
-      });
-    }
-  }
-
-  // weld sparks at gantry
-  for(const c of lineCars){
-    if(Math.abs(c.y - WELD_Y) < 0.35 && Math.random() < 0.5 * eff){
-      const p = iso(LX+0.5, WELD_Y+0.5, PZ+0.55);
-      sparks.push({ x:p.x, y:p.y, vx:(Math.random()-0.5)*70, vy:-Math.random()*60-10, life:0.35 });
-    }
-  }
-
-  // road cars follow waypoint paths
-  const roadSp = 1.7 * eff;
-  for(let i=roadCars.length-1; i>=0; i--){
-    const c = roadCars[i];
-    if(c.parked) continue;
-    const tgt = c.path[c.pi];
-    const dx = tgt.x - c.x, dy = tgt.y - c.y, dist = Math.hypot(dx, dy);
-    if(dist < 0.06){
-      c.pi++;
-      if(c.pi >= c.path.length){
-        if(c.slot){ c.parked = true; c.vx = 0; c.vy = 0; }
-        else roadCars.splice(i, 1);
-        continue;
-      }
-    } else {
-      c.vx = dx/dist; c.vy = dy/dist;
-      c.x += c.vx * roadSp * dt;
-      c.y += c.vy * roadSp * dt;
-    }
-  }
-
-  // lot management: keep parked count near lotTarget from sim
-  const parked = roadCars.filter(c => c.parked && !c.isRecall);
-  if(parked.length >= Math.min(simSignals.lotTarget + 1, SLOTS.length)){
-    const ship = parked[0];
-    if(ship.slot){ ship.slot.car = null; ship.slot = null; }
-    ship.parked = false;
-    ship.path = [{x:ship.x,y:7.3},{x:13.8,y:7.3},{x:13.8,y:11}];
-    ship.pi = 0;
-  }
-
-  // workers
-  for(const w of workers){
-    if(w.type === 'patrol'){
-      const tgt = w.wp[w.i];
-      const dx = tgt.x-w.x, dy = tgt.y-w.y, d = Math.hypot(dx, dy);
-      if(d < 0.05) w.i = (w.i+1) % w.wp.length;
-      else { w.x += dx/d*w.sp*eff*dt; w.y += dy/d*w.sp*eff*dt; }
-      w.ph += dt * eff * 9;
-    } else {
-      w.ph += dt * eff * 5;
-    }
-  }
-
-  // forklift
-  {
-    const f = forklift, tgt = f.wp[f.i];
-    const dx = tgt.x-f.x, dy = tgt.y-f.y, d = Math.hypot(dx, dy);
-    if(d < 0.06){ f.i = (f.i+1) % f.wp.length; f.carry = f.i < 2; }
-    else { f.vx = dx/d; f.vy = dy/d; f.x += dx/d*f.sp*eff*dt; f.y += dy/d*f.sp*eff*dt; }
-    f.ph += dt;
-  }
-
-  // smoke from stack
-  if(Math.random() < 0.6){
-    const p = iso(1.0, 0.6, 2.5);
-    smoke.push({ x:p.x, y:p.y, r:5, vy:-12-Math.random()*8, vx:8+Math.random()*6, life:1 });
-  }
-  for(let i=smoke.length-1; i>=0; i--){
-    const s = smoke[i];
-    s.x += s.vx*dt; s.y += s.vy*dt; s.r += 9*dt; s.life -= 0.32*dt;
-    if(s.life <= 0) smoke.splice(i, 1);
-  }
-  for(let i=sparks.length-1; i>=0; i--){
-    const s = sparks[i];
-    s.x += s.vx*dt; s.y += s.vy*dt; s.vy += 200*dt; s.life -= dt;
-    if(s.life <= 0) sparks.splice(i, 1);
-  }
-  for(const cl of clouds){ cl.x += cl.sp*dt*0.06; if(cl.x > 1.2) cl.x = -0.3; }
-}
-
-// ── draw car (with bodystyle variants) ─────────────────────────────────────
-function drawCar(wx, wy, wz, color, vx, vy, stage, bs){
-  bs = bs || 'sedan';
-  const sh = BS_SHAPES[bs] || BS_SHAPES.sedan;
-  const alongX = Math.abs(vx) >= Math.abs(vy);
-  const len = 0.82 * sh.lm, wid = 0.46 * sh.wm;
-  const w = alongX ? len : wid, d = alongX ? wid : len;
-  const x = wx - w/2, y = wy - d/2;
-  const bz = wz + sh.ride;
-
-  // wheels (stage 4)
-  if(stage >= 4){
-    const ws = 0.12;
-    [[x+0.07,y+0.04],[x+w-0.19,y+0.04],[x+0.07,y+d-0.16],[x+w-0.19,y+d-0.16]].forEach(p=>{
-      box(p[0],p[1],bz,ws,ws,0.10,'#23262C');
-    });
-  }
-
-  if(stage === 1){ box(x,y,bz+0.06,w,d,0.10,'#41454D'); return; }
-
-  // body
-  const bodyZ = stage >= 4 ? bz+0.12 : bz+0.06;
-  box(x,y,bodyZ,w,d,sh.bH,color,{outline:'rgba(0,0,0,.12)'});
-
-  // cabin (stage 3+)
-  if(stage >= 3){
-    if(sh.bed){
-      // pickup: cabin over rear 40% only; bed (open body top) at front
-      const cabLen = alongX ? w*0.40 : d*0.40;
-      const cabWid = alongX ? d*0.85 : w*0.85;
-      const cx = alongX ? (vx>=0 ? x : x+w-cabLen) : x+(w-cabWid)/2;
-      const cy = alongX ? y+(d-cabWid)/2 : (vy>=0 ? y : y+d-cabLen);
-      const cw = alongX ? cabLen : cabWid;
-      const cd = alongX ? cabWid : cabLen;
-      box(cx,cy,bodyZ+sh.bH,cw,cd,sh.cabH,shade(color,18));
-      const gz = bodyZ+sh.bH+sh.cabH;
-      const a=iso(cx,cy,gz), b=iso(cx+cw,cy,gz), c2=iso(cx+cw,cy+cd,gz), d2=iso(cx,cy+cd,gz);
-      ctx.fillStyle = night ? '#1b2740' : '#9fc4e0'; quad(a,b,c2,d2);
-    } else {
-      // sedan / suv / coupe: full-width cabin
-      const cw = alongX ? w*sh.cabRat : w*0.74;
-      const cd = alongX ? d*0.74 : d*sh.cabRat;
-      const cx = alongX ? x+(vx>=0 ? w*0.18 : w*(1-sh.cabRat-0.18)) : x+(w-cw)/2;
-      const cy = alongX ? y+(d-cd)/2 : y+(vy>=0 ? d*0.18 : d*(1-sh.cabRat-0.18));
-      box(cx,cy,bodyZ+sh.bH,cw,cd,sh.cabH,shade(color,18));
-      const gz = bodyZ+sh.bH+sh.cabH;
-      const a=iso(cx,cy,gz), b=iso(cx+cw,cy,gz), c2=iso(cx+cw,cy+cd,gz), d2=iso(cx,cy+cd,gz);
-      ctx.fillStyle = night ? '#1b2740' : '#9fc4e0'; quad(a,b,c2,d2);
-    }
-  }
-
-  // headlights at night
-  if(stage >= 4 && night){
-    const fx = alongX ? (vx>=0 ? x+w : x) : x+w/2;
-    const fy = alongX ? y+d/2 : (vy>=0 ? y+d : y);
-    const fp = iso(fx, fy, bodyZ+0.05);
-    ctx.fillStyle = 'rgba(255,245,200,.95)';
-    ctx.beginPath(); ctx.arc(fp.x,fp.y,2.4,0,7); ctx.fill();
-  }
-}
-
-// ── sky ──────────────────────────────────────────────────────────────────────
-function drawSky(){
-  const g = ctx.createLinearGradient(0,0,0,H);
-  if(night){
-    g.addColorStop(0,'#161E30'); g.addColorStop(.7,'#243049'); g.addColorStop(1,'#2C3A55');
-  } else {
-    g.addColorStop(0,'#9FD6EE'); g.addColorStop(.55,'#CFEAF4'); g.addColorStop(1,'#E8F4E0');
-  }
-  ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
-  if(night){
-    ctx.fillStyle = 'rgba(255,255,255,.8)';
-    for(let i=0; i<40; i++){
-      const sx=(i*97.3)%W, sy=(i*53.7)%(H*0.5);
-      ctx.globalAlpha = 0.3+0.5*((i*13)%7)/7;
-      ctx.fillRect(sx,sy,1.6,1.6);
-    }
-    ctx.globalAlpha = 1;
-  }
-  for(const cl of clouds){
-    const cx=cl.x*W, cy=cl.y*H, s=cl.s*40;
-    ctx.fillStyle = night ? 'rgba(190,200,220,.10)' : 'rgba(255,255,255,.7)';
-    const blob = (bx,by,r) => { ctx.beginPath(); ctx.ellipse(bx,by,r,r*0.62,0,0,7); ctx.fill(); };
-    blob(cx,cy,s); blob(cx+s*0.9,cy+s*0.12,s*0.8); blob(cx-s*0.8,cy+s*0.15,s*0.7);
-  }
-}
-
-// ── ground ────────────────────────────────────────────────────────────────────
-function drawGround(){
-  for(let x=-1; x<13; x++) for(let y=-1; y<11; y++){
-    let col = '#8FC96B';
-    if(x>=0&&x<=4&&y>=0&&y<=6.5)         col = '#C6CAD0';
-    if(x>=7.6&&x<=12.4&&y>=0.4&&y<=6)    col = '#BFC3C9';
-    if(Math.abs(y-7)<1.0&&x>=0&&x<=13)   col = '#646973';
-    if(night) col = shade(col, -46);
-    tile(x,y,col,night?'rgba(0,0,0,.10)':'rgba(0,0,0,.05)');
-  }
-  for(let x=0.2; x<13; x+=0.9)
-    isoLine(x,7,x+0.45,7,0.01,night?'#9a8a3a':'#E8C84A',3*S());
-  for(const s of SLOTS){
-    const a=iso(s.x-0.45,s.y-0.55,0.01), b=iso(s.x+0.45,s.y-0.55,0.01),
-          c=iso(s.x+0.45,s.y+0.55,0.01), d=iso(s.x-0.45,s.y+0.55,0.01);
-    ctx.strokeStyle = night?'rgba(255,255,255,.18)':'rgba(255,255,255,.6)';
-    ctx.lineWidth = 1.4;
-    ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y);
-    ctx.lineTo(c.x,c.y); ctx.lineTo(d.x,d.y); ctx.closePath(); ctx.stroke();
-  }
-}
-
-// ── conveyor ──────────────────────────────────────────────────────────────────
-function drawConveyor(){
-  box(LX-0.55,LY0-0.4,0,1.1,(LY1-LY0)+0.8,PZ,'#9AA0A8');
-  const bx = LX-0.4, bw = 0.8;
-  box(bx,LY0-0.3,PZ,bw,(LY1-LY0)+0.6,0.02,'#3A3E45');
-  const off = (fT * 0.85 * getEffSpeed()) % 0.5;
-  for(let yy=LY0-0.3+off; yy<LY1+0.3; yy+=0.5)
-    isoLine(bx,yy,bx+bw,yy,PZ+0.03,'#5a5f68',2*S());
-  [2.0,5.2].forEach(yy=>{
-    box(LX-0.55,yy,PZ,0.06,0.5,0.06,'#F2B544');
-    box(LX+0.49,yy,PZ,0.06,0.5,0.06,'#F2B544');
-  });
-}
-
-// ── gantry ────────────────────────────────────────────────────────────────────
-function drawGantry(){
-  const gz = PZ+0.95;
-  box(LX-0.62,WELD_Y-0.1,0,0.12,0.12,gz,'#B8BEC6');
-  box(LX+0.52,WELD_Y-0.1,0,0.12,0.12,gz,'#B8BEC6');
-  box(LX-0.62,WELD_Y+0.45,0,0.12,0.12,gz,'#B8BEC6');
-  box(LX+0.52,WELD_Y+0.45,0,0.12,0.12,gz,'#B8BEC6');
-  box(LX-0.62,WELD_Y-0.1,gz,1.26,0.12,0.16,'#F2B544');
-  box(LX-0.62,WELD_Y+0.45,gz,1.26,0.12,0.16,'#F2B544');
-  const carHere = lineCars.some(c => Math.abs(c.y - WELD_Y) < 0.4);
-  const bob = carHere ? (Math.sin(fT*14)*0.06 - 0.18) : 0.05;
-  box(LX-0.12,WELD_Y+0.12,gz-0.45+bob,0.24,0.24,0.3,'#586070');
-  if(carHere){
-    const p = iso(LX, WELD_Y+0.24, gz-0.5+bob);
-    ctx.fillStyle = `rgba(180,220,255,${0.4+0.4*Math.random()})`;
-    ctx.beginPath(); ctx.arc(p.x,p.y,4+Math.random()*3,0,7); ctx.fill();
-  }
-}
-
-// ── worker ─────────────────────────────────────────────────────────────────
-function drawWorker(w){
-  const bob = Math.abs(Math.sin(w.ph)) * 0.05;
-  box(w.x-0.07,w.y-0.05,0,0.14,0.1,0.16+(w.type!=='idle'?Math.sin(w.ph)*0.02:0),'#2E3A59');
-  box(w.x-0.08,w.y-0.06,0.16+bob,0.16,0.12,0.2,'#F2B544');
-  const hp = iso(w.x,w.y,0.38+bob);
-  ctx.fillStyle='#E8B58A'; ctx.beginPath(); ctx.arc(hp.x,hp.y,3.6*S(),0,7); ctx.fill();
-  ctx.fillStyle='#E8584B'; ctx.beginPath(); ctx.arc(hp.x,hp.y-1.5*S(),4*S(),Math.PI,0); ctx.fill();
-}
-
-// ── forklift ──────────────────────────────────────────────────────────────────
-function drawForklift(f){
-  const facingX = Math.abs(f.vx||0) >= Math.abs(f.vy||1);
-  const fw = facingX?0.5:0.32, fd = facingX?0.32:0.5;
-  box(f.x-fw/2,f.y-fd/2,0,fw,fd,0.22,'#F2A33C');
-  box(f.x-fw/2+0.03,f.y-fd/2+0.03,0.22,fw-0.06,fd-0.06,0.16,'#D98A2B');
-  if(f.carry) box(f.x-0.12,f.y-0.12,0.4,0.24,0.24,0.18,'#B07A45');
-}
-
-// ── static structures ─────────────────────────────────────────────────────────
-function drawStaticStructures(list){
-  list.push({z:0.6, f:()=>{
-    box(0.78,0.4,0,0.44,0.44,2.4,'#C7553E');
-    box(0.78,0.4,1.9,0.44,0.44,0.18,'#EDEFF3');
-    box(0.74,0.36,2.4,0.52,0.52,0.12,'#8E3E2E');
-  }});
-  list.push({z:0.2, f:()=>{
-    box(-0.15,-0.15,0,0.16,6.6,1.3,night?'#3a4254':'#D8DDE3');
-    for(let yy=0.2; yy<6.4; yy+=1.2) box(-0.15,yy,1.3,4.4,0.08,0.06,'#9098A4');
-  }});
-  list.push({z:0.5, f:()=>{
-    box(0.3,1.3,0,0.4,0.4,0.4,'#B07A45'); box(0.3,1.3,0.4,0.4,0.4,0.4,'#A56E3C');
-    box(0.78,1.35,0,0.4,0.4,0.4,'#B07A45');
-  }});
-  list.push({z:6.4, f:()=>{
-    box(12.4,6.2,0,0.1,0.1,1.6,'#5A6270');
-    box(12.0,6.0,1.6,0.9,0.5,0.5,night?'#C99A2E':'#F2B544');
-    const p = iso(12.45,6.25,2.1);
-    ctx.fillStyle = '#10141C'; ctx.font = `700 ${9*S()}px Archivo,sans-serif`;
-    ctx.textAlign = 'center'; ctx.fillText('MARQUE',p.x,p.y);
-  }});
-  [[7.8,0.4],[12.2,0.4],[7.8,6.4]].forEach(L=>{
-    list.push({z:L[1]+0.5, f:()=>{
-      box(L[0],L[1],0,0.08,0.08,1.4,'#4A515C');
-      box(L[0]-0.05,L[1]-0.05,1.4,0.2,0.2,0.1,night?'#FFF4C2':'#C9CDD2');
-      if(night){
-        const p = iso(L[0]+0.05,L[1]+0.05,1.45);
-        const g = ctx.createRadialGradient(p.x,p.y,0,p.x,p.y,46);
-        g.addColorStop(0,'rgba(255,235,160,.5)'); g.addColorStop(1,'rgba(255,235,160,0)');
-        ctx.fillStyle = g; ctx.beginPath(); ctx.arc(p.x,p.y,46,0,7); ctx.fill();
-      }
-    }});
-  });
-}
-
-// ── main frame ─────────────────────────────────────────────────────────────────
-function frame(){
-  ctx.clearRect(0,0,W,H);
-  drawSky();
-  drawGround();
-  drawConveyor();
-
-  const list = [];
-  drawStaticStructures(list);
-
-  for(const c of lineCars)
-    list.push({z:c.y, f:()=>drawCar(LX,c.y,PZ,c.color,0,1,stageForY(c.y),c.bs)});
-
-  for(const c of roadCars){
-    list.push({z:c.y+c.x*0.001, f:()=>{
-      drawCar(c.x,c.y,0,c.color,c.vx,c.vy,4,c.bs);
-      // recall badge: red car driving the wrong way
-      if(c.isRecall && !c.parked){
-        const p = iso(c.x, c.y, 0.8);
-        ctx.font = `700 ${10*S()}px sans-serif`;
-        ctx.fillStyle = '#E5605E'; ctx.textAlign = 'center';
-        ctx.fillText('⚠', p.x, p.y);
-      }
-    }});
-  }
-
-  for(const w of workers) list.push({z:w.y+0.02, f:()=>drawWorker(w)});
-  list.push({z:forklift.y, f:()=>drawForklift(forklift)});
-  list.push({z:WELD_Y+0.6, f:drawGantry});
-
-  list.sort((a,b) => a.z - b.z);
-  for(const it of list) it.f();
-
-  // engine badge near gantry — shows what type is on the line
-  const weldCar = lineCars.find(c => stageForY(c.y) >= 3);
-  if(weldCar && simSignals.engId){
-    const p = iso(LX+0.1, WELD_Y-0.7, PZ+0.72);
-    ctx.font = `600 ${8*S()}px IBM Plex Mono,monospace`;
-    ctx.fillStyle = 'rgba(242,163,60,.88)'; ctx.textAlign = 'center';
-    ctx.fillText(simSignals.engId, p.x, p.y);
-  }
-
-  // sparks (screen space, on top of weld)
-  for(const s of sparks){
-    ctx.fillStyle = `rgba(255,${200+Math.random()*55|0},120,${clamp(s.life*2.5,0,1)})`;
-    ctx.fillRect(s.x,s.y,2,2);
-  }
-  // smoke
-  for(const s of smoke){
-    ctx.fillStyle = `rgba(${night?'150,160,180':'235,238,242'},${clamp(s.life*0.5,0,0.5)})`;
-    ctx.beginPath(); ctx.arc(s.x,s.y,s.r,0,7); ctx.fill();
-  }
-
-  // health tint: subtle dark overlay when company is struggling
-  if(simSignals.healthTint < -0.1){
-    const alpha = Math.min(0.22, (-simSignals.healthTint - 0.1) * 0.28);
-    ctx.fillStyle = `rgba(20,10,10,${alpha.toFixed(3)})`;
-    ctx.fillRect(0,0,W,H);
-  }
-
-  // night ambience overlay
-  if(night){ ctx.fillStyle='rgba(20,28,50,.22)'; ctx.fillRect(0,0,W,H); }
-}
-
-// ── RAF loop ───────────────────────────────────────────────────────────────────
-let last = 0;
-function loop(now){
-  if(!cv) return;
-  let dt = (now - last) / 1000; last = now; dt = Math.min(dt, 0.05);
-  updateWorld(dt);
-  frame();
-  requestAnimationFrame(loop);
-}
-
-// ── public API ─────────────────────────────────────────────────────────────────
-
-function init(canvasEl){
-  cv  = canvasEl;
-  ctx = cv.getContext('2d');
-  resize(); fit();
-  window.addEventListener('resize', () => { resize(); fit(); });
-  // reset sim state so re-init (e.g. headless tests) starts clean
-  lineCars.length = 0;
-  roadCars.length = 0;
-  smoke.length = 0;
-  sparks.length = 0;
-  spawnTimer = 0;
-  fT = 0;
-  pendingRecall = false;
-  primeLineCars();
-  last = performance.now();
-  requestAnimationFrame(loop);
-}
-
-// Map a production volume (k units/q) onto the line speed + lot fill.
-let companyUnits = 0;          // last whole-company output
-let focusUnits  = null;        // a specific plant's output when one is selected
-function applyUnits(u){
-  simSignals.lineSpeed = Math.max(0.35, Math.min(2.0, u / 90));
-  simSignals.lotTarget = u > 0 ? Math.min(SLOTS.length, Math.round(u / 8)) : 3;
-}
-
-// Focus the interior on a single plant's last-quarter output (or null = the whole
-// company). Read-only — never touches sim state.
-function setFocus(units){
-  focusUnits = (units == null) ? null : units;
-  applyUnits(focusUnits != null ? focusUnits : companyUnits);
-}
-
-function update(simState, extras){
-  extras = extras || {};
-  const player = simState.companies.find(c => c.player);
-
-  // find player's most recently active model
-  const active = player.models.filter(m => m.active);
-  const model  = active[active.length - 1] || null;
-
-  // line speed + lot fill from production volume (respecting any plant focus)
-  companyUnits = simState.lastUnits || 0;
-  applyUnits(focusUnits != null ? focusUnits : companyUnits);
-
-  if(model){
-    simSignals.bodystyle  = model.segId;
-    simSignals.modelColor = BS_COLORS[model.segId] || '#E8584B';
-    simSignals.engId      = model.engId;
-  }
-
-  // recall visual: fire on next car graduation
-  if(extras.hasRecall) pendingRecall = true;
-
-  // health tint: $200M is "normal" profit; negative = struggling
-  simSignals.healthTint = Math.max(-1, Math.min(1, (simState.lastProfit || 0) / 200));
-
-  // update cars currently on the line so they reflect new model immediately
-  for(const c of lineCars){
-    c.bs    = simSignals.bodystyle;
-    c.color = simSignals.modelColor;
-  }
-}
-
-function setViewSpeed(n){ viewSpeed = n; }
-function setNight(b){ night = !!b; }
-
-// Advance simulation by dt seconds without drawing. Decoupled from rAF so
-// headless tests can fast-forward state deterministically.
-function step(dt){ updateWorld(Math.min(dt, 0.05)); }
-
-// Read current factory state for assertions. Never writes to sim.
-function getState(){
-  return {
-    pendingRecall,
-    lineCars: lineCars.map(c => ({ bs: c.bs, color: c.color, y: +c.y.toFixed(3) })),
-    roadCars: roadCars.map(c => ({ parked: c.parked, isRecall: !!c.isRecall })),
-    parked: roadCars.filter(c => c.parked && !c.isRecall).length,
-    simSignals: Object.assign({}, simSignals),
-  };
-}
-
-return { init, update, step, getState, setViewSpeed, setNight, setFocus };
-
-})();
-
-</script>
-<script>
-/* marque-world.js — MARQUE campus builder (PART B, v2 architecture slice)
- *
- * The WORLD owns campus state: an isometric grid of placed buildings, selection,
- * placement, and rendering. It never runs the economy and never mutates sim
- * internals. The only thing it hands the economy is a derived input bundle via
- * deriveCampusInputs(); the shell applies that to the sim at quarter advance.
- *
- * Money: the world never touches sim state. To pay for a build it asks the shell
- * through the onSpend() callback (which deducts player cash and returns success).
- *
- * Headless-safe: all campus logic is pure functions over a plain campus object,
- * and step(dt) is decoupled from requestAnimationFrame, so the campus can be
- * tested and stepped without a DOM (rAF is frozen in hidden tabs).
- *
- * Tonight's catalog: the Assembly Plant only. Its level sets production capacity,
- * which is the one campus input the sim actually consumes this build.
- */
-
 /* marque-world.js — MARQUE campus builder (PART B, v2 architecture slice)
  *
  * The WORLD owns campus state: an isometric grid of placed buildings, selection,
@@ -1688,11 +1012,18 @@ function applyProduction(campus, totalUnits){
 // ── stateful layer (canvas + interaction) ────────────────────────────────────
 let cv, ctx, W=0, H=0, DPR=1;
 let campus = freshCampus();
-let opts = {};                 // { menuEl, inspectorEl, getCash, onSpend, onChange }
+let opts = {};                 // { menuEl, inspectorEl, getCash, onSpend, onChange, ... }
 let buildType = null;          // current build-mode type, or null
 let ghost = { x:0, y:0, on:false };
 let hoverId = null;
 let wT = 0, rafId = 0;
+
+// ── factory animation state ──────────────────────────────────────────────────
+let factorySimState = null;
+const BS_COLORS_WORLD = { sedan:'#E8584B', suv:'#3F8EE0', pickup:'#46B97A', coupe:'#8E6BD8' };
+
+// ── ambient campus agents (workers + forklift) ───────────────────────────────
+let agents = [], agentCampusStamp = -1;
 
 // ── iso projection (with user pan + zoom) ────────────────────────────────────
 const TW=46, TH=23, ZS=20;
@@ -1711,7 +1042,10 @@ function resize(){
 function fit(){
   view.sc = Math.max(0.55, Math.min(W/620, H/360, 1.5));
   view.ox = W*0.5;
-  view.oy = H*0.30;
+  const sc = effSc();
+  const gridH = (GRID_W + GRID_D) * (TH / 2) * sc;
+  const toolbarH = 46;
+  view.oy = Math.max(8, Math.round((H - toolbarH - gridH) / 2));
 }
 function iso(x,y,z){
   const sc = effSc();
@@ -1749,6 +1083,116 @@ function prism(x,y,w,d,h,col,opt){
   if(opt.outline){ ctx.strokeStyle=opt.outline; ctx.lineWidth=opt.outlineW||1.4; ctx.stroke(); }
 }
 
+// ── factory animation + ambient agents ──────────────────────────────────────
+function setSimState(state){ factorySimState = state; }
+
+function stepAgents(dt){
+  // reinitialize when campus changes size (building placed/removed)
+  const stamp = campus.objects.length;
+  if(stamp !== agentCampusStamp){
+    agentCampusStamp = stamp;
+    agents = [];
+    for(let i=0;i<3;i++) agents.push({
+      type:'worker', ph:Math.random()*6.28,
+      x:0.5+Math.random()*(GRID_W-1), y:0.5+Math.random()*(GRID_D-1),
+      tx:0.5+Math.random()*(GRID_W-1), ty:0.5+Math.random()*(GRID_D-1)
+    });
+    if(campus.objects.some(o=>o.type==='assembly'))
+      agents.push({type:'forklift',ph:0,x:2,y:1,tx:3,ty:4});
+  }
+  agents.forEach(a=>{
+    const dx=a.tx-a.x, dy=a.ty-a.y, dist=Math.hypot(dx,dy);
+    if(dist<0.18){
+      a.tx=0.5+Math.random()*(GRID_W-1);
+      a.ty=0.5+Math.random()*(GRID_D-1);
+    } else {
+      const spd=a.type==='forklift'?0.72:0.42;
+      a.x+=dx/dist*spd*dt; a.y+=dy/dist*spd*dt;
+    }
+    a.ph+=dt*(a.type==='worker'?5.5:2.5);
+  });
+}
+
+function drawAgent(a){
+  if(a.type==='worker'){
+    const bob=Math.sin(a.ph)*0.014;
+    const b=iso(a.x,a.y,0.06+bob), h=iso(a.x,a.y,0.23+bob);
+    ctx.fillStyle='#E8B58A'; ctx.beginPath(); ctx.arc(h.x,h.y,2.2*effSc(),0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#F2B544'; ctx.beginPath(); ctx.arc(b.x,b.y,3.2*effSc(),0,Math.PI*2); ctx.fill();
+  } else {
+    const p=iso(a.x,a.y,0.08); const s=5*effSc();
+    ctx.fillStyle='#F2A33C'; ctx.fillRect(p.x-s,p.y-s*.5,s*2.1,s);
+    ctx.fillStyle='#C8731A'; ctx.fillRect(p.x-s*.4,p.y-s*.5,s*.8,s*.8);
+  }
+}
+
+function drawBuildingAnimated(o){
+  const d=def(o.type), lv=d.levels[o.level];
+  if(o.type==='assembly'){
+    const cap=capacityOf(o);
+    const util=cap>0?Math.min(o.lastOutput/cap,1):0;
+    if(util<=0) return;
+    const beltD=o.y+d.d*0.42, beltH=lv.h*0.82;
+    const bl=iso(o.x+0.22,beltD,beltH), br=iso(o.x+d.w-0.22,beltD,beltH);
+    ctx.strokeStyle='rgba(80,90,105,0.65)'; ctx.lineWidth=2.2*effSc();
+    ctx.beginPath(); ctx.moveTo(bl.x,bl.y); ctx.lineTo(br.x,br.y); ctx.stroke();
+    // car color from latest active model
+    let carColor='#F2A33C';
+    if(factorySimState){
+      const player=factorySimState.companies&&factorySimState.companies.find(c=>c.player);
+      if(player){
+        const m=player.models&&player.models.filter(x=>x.active).slice(-1)[0];
+        if(m) carColor=BS_COLORS_WORLD[m.segId]||'#F2A33C';
+      }
+    }
+    const nCars=Math.max(1,Math.round(util*3));
+    for(let i=0;i<nCars;i++){
+      const ph=((wT*0.28+i/nCars)%1);
+      const cx=o.x+0.25+(d.w-0.5)*ph;
+      const cp=iso(cx,beltD,beltH+0.09);
+      const r=4.5*effSc();
+      ctx.fillStyle=carColor; ctx.strokeStyle='rgba(0,0,0,.35)'; ctx.lineWidth=0.9;
+      ctx.beginPath(); ctx.arc(cp.x,cp.y,r,0,Math.PI*2); ctx.fill(); ctx.stroke();
+    }
+  } else if(o.type==='rdlab'){
+    const pulse=(Math.sin(wT*1.8)*0.5+0.5);
+    const p=iso(o.x+d.w/2,o.y+d.d/2,lv.h+0.22);
+    const r=(6+pulse*5)*effSc();
+    ctx.strokeStyle=`rgba(59,142,165,${0.22+pulse*0.44})`; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.arc(p.x,p.y,r,0,Math.PI*2); ctx.stroke();
+    ctx.strokeStyle=`rgba(59,142,165,${0.07+pulse*0.14})`; ctx.lineWidth=0.8;
+    ctx.beginPath(); ctx.arc(p.x,p.y,r+5*effSc(),0,Math.PI*2); ctx.stroke();
+  } else if(o.type==='studio'){
+    const pulse=(Math.sin(wT*2.2)*0.5+0.5);
+    const p=iso(o.x+d.w/2,o.y,lv.h+0.32);
+    ctx.fillStyle=`rgba(124,111,214,${0.42+pulse*0.38})`;
+    ctx.beginPath(); ctx.arc(p.x,p.y,(2.8+pulse*2.2)*effSc(),0,Math.PI*2); ctx.fill();
+  }
+}
+
+function buildTooltipHtml(o){
+  const d=def(o.type), lv=d.levels[o.level];
+  const cap=capacityOf(o);
+  if(o.type==='assembly'){
+    const util=cap>0?Math.round(clamp(o.lastOutput/cap,0,1)*100):0;
+    return `<b>${d.name} L${o.level}</b> · ${cap}k cap · ${util}% util`;
+  }
+  if(o.type==='studio') return `<b>${d.name} L${o.level}</b> · click to see lineup &amp; price`;
+  if(o.type==='rdlab'){
+    const label={eng:'Powertrain',eff:'Reliability',mfg:'Manufacturing'}[o.labFocus||'eng'];
+    return `<b>${d.name} L${o.level}</b> · +$${o.level>=2?60:30}M/q ${label}`;
+  }
+  return `<b>${d.name}</b>`;
+}
+
+function getSelectedBuildingScreenPos(){
+  const o=campus.objects.find(x=>x.id===campus.selectedId);
+  if(!o||!ctx) return null;
+  const d=def(o.type), lv=d.levels[o.level];
+  const p=iso(o.x+d.w/2, o.y, lv.h+0.4);
+  return { x:p.x, y:p.y };
+}
+
 // ── render ───────────────────────────────────────────────────────────────────
 function render(){
   if(!ctx) return;
@@ -1774,10 +1218,11 @@ function render(){
     }
   }
 
-  // buildings, depth-sorted by footprint far corner
+  // buildings + agents, depth-sorted
   const drawList = campus.objects.map(o=>({ o, z:o.x+o.y }));
   drawList.sort((a,b)=>a.z-b.z);
-  for(const it of drawList) drawBuilding(it.o);
+  for(const it of drawList){ drawBuilding(it.o); drawBuildingAnimated(it.o); }
+  agents.forEach(a=>drawAgent(a));
 
   // ghost building silhouette + a one-line hint (snapped / why-invalid)
   if(buildType && ghost.on && inBounds(buildType,ghost.x,ghost.y)){
@@ -1886,10 +1331,19 @@ function onMove(ev){
     if(wasPan){ panX=downPanX+dx; panY=downPanY+dy; setCursor(); return; }
   }
   if(buildType){ computeGhost(mouseSX,mouseSY); }
-  else { const t=screenToTile(mouseSX,mouseSY); hoverId=pickAt(t.x,t.y); }
+  else {
+    const t=screenToTile(mouseSX,mouseSY); const id=pickAt(t.x,t.y); hoverId=id;
+    if(opts.onHoverTip){
+      if(id){ const ho=campus.objects.find(x=>x.id===id); opts.onHoverTip(ho?buildTooltipHtml(ho):null,mouseSX,mouseSY); }
+      else opts.onHoverTip(null,0,0);
+    }
+  }
   setCursor();
 }
-function onLeave(){ ghost.on=false; hoverId=null; mouseDown=false; wasPan=false; mouseInside=false; }
+function onLeave(){
+  ghost.on=false; hoverId=null; mouseDown=false; wasPan=false; mouseInside=false;
+  if(opts.onHoverTip) opts.onHoverTip(null,0,0);
+}
 function onWheel(ev){
   if(!cv) return;
   ev.preventDefault();
@@ -1903,7 +1357,10 @@ function onWheel(ev){
 function onContext(ev){ ev.preventDefault(); if(buildType) disarm(); }    // right-click cancels
 function onKeyDown(ev){
   if(ev.code==='Space'){ spaceHeld=true; setCursor(); }
-  else if(ev.key==='Escape' && buildType){ disarm(); }
+  else if(ev.key==='Escape'){
+    if(buildType){ disarm(); }
+    else if(campus.selectedId!=null){ campus.selectedId=null; renderPanels(); notifySelect(); }
+  }
 }
 function onKeyUp(ev){ if(ev.code==='Space'){ spaceHeld=false; setCursor(); } }
 
@@ -1936,9 +1393,6 @@ function onClick(ev){
     campus.selectedId = id;
     renderPanels();
     notifySelect();
-    // a Design Studio's primary effect is to open the car-design flow on click
-    const sel = campus.objects.find(o=>o.id===id);
-    if(sel && sel.type==='studio' && opts.onStudioOpen) opts.onStudioOpen();
   }
 }
 let flashMsg='', flashT=0;
@@ -1964,9 +1418,7 @@ function renderPanels(){
 const BUILDABLE = ['assembly','studio','rdlab'];
 function renderMenu(){
   if(!opts.menuEl) return;
-  // armed state: highlight the campus tile area so new players know WHERE to click
-  const campusEl = opts.menuEl.closest ? opts.menuEl.closest('.campus') : null;
-  if(campusEl) campusEl.classList.toggle('campus-armed', !!buildType);
+  if(opts.onArmChange) opts.onArmChange(!!buildType);
   const cash = opts.getCash? Math.round(opts.getCash()):0;
   const inputs = deriveCampusInputs(campus);
   const studio = inputs.designStudio;
@@ -1986,7 +1438,8 @@ function renderMenu(){
 function renderInspector(){
   if(!opts.inspectorEl) return;
   const o = campus.objects.find(x=>x.id===campus.selectedId);
-  if(!o){ opts.inspectorEl.innerHTML = `<div class="winsp-empty">Select a building to inspect it.</div>`; return; }
+  if(!o){ opts.inspectorEl.innerHTML = `<div class="winsp-empty">Select a building to inspect it.</div>`;
+    if(opts.onInspectorUpdated) opts.onInspectorUpdated(null); return; }
   if(o.type==='rdlab'){
     const d=def(o.type);
     const upCost=upgradeCostOf(o);
@@ -2018,6 +1471,7 @@ function renderInspector(){
            : `<button class="btn" disabled>Max level</button>`}
          <button class="btn danger" onclick="MarqueWorld.demolishSelected()">Demolish</button>
        </div>`;
+    if(opts.onInspectorUpdated) opts.onInspectorUpdated(o.id);
     return;
   }
   if(o.type==='studio'){
@@ -2029,21 +1483,42 @@ function renderInspector(){
     const perk = o.level>=2
       ? 'Refreshes 30% cheaper · novelty restores to 94%'
       : 'Upgrade for 30% off refreshes + stronger novelty restore';
+    // active model pricing rows (TASK 4: world is the complete control surface)
+    const models = opts.getActiveModels ? opts.getActiveModels() : [];
+    const modelRows = models.length===0
+      ? `<div style="font-family:var(--mono);font-size:10px;color:var(--dimmer);padding:6px 0">No active models yet.</div>`
+      : models.map(m=>`
+        <div style="border-top:1px solid var(--line);padding-top:7px;margin-top:2px">
+          <div style="display:flex;justify-content:space-between;margin-bottom:3px">
+            <b style="font-size:12px">${m.name}</b>
+            <span style="color:var(--amber)">$<span id="wip-pv-${m.segId}">${m.price.toFixed(1)}</span>k</span>
+          </div>
+          <div style="background:var(--line);height:2px;border-radius:1px;margin-bottom:4px;overflow:hidden">
+            <div style="height:100%;width:${m.nov}%;background:${m.nov>60?'var(--green)':m.nov>35?'var(--amber)':'var(--red)'}"></div>
+          </div>
+          <input type="range" min="${m.floor}" max="${m.ceil}" step="0.1" value="${m.price}"
+            style="-webkit-appearance:none;appearance:none;width:100%;height:3px;background:var(--line);border-radius:2px;outline:none;margin:0 0 4px"
+            oninput="worldSetModelPrice('${m.segId}',parseFloat(this.value));document.getElementById('wip-pv-${m.segId}').textContent=parseFloat(this.value).toFixed(1)">
+          <div style="display:flex;gap:4px">
+            <button class="btn" style="flex:1;padding:3px 0;font-size:10px" onclick="doRefresh('${m.segId}')">Refresh</button>
+            <button class="btn" style="flex:1;padding:3px 0;font-size:10px" onclick="openStudio('${m.segId}')">Redesign</button>
+          </div>
+        </div>`).join('');
     opts.inspectorEl.innerHTML =
       `<div class="winsp-name">${d.name} <span class="winsp-lvl">Level ${o.level}</span></div>
        <div class="winsp-grid">
          <div><span class="wk">Status</span><span class="wv">${status}</span></div>
-         <div><span class="wk">Projects</span><span class="wv">1 at a time</span></div>
-         <div><span class="wk">Perk</span><span class="wv" style="font-size:11px">${perk}</span></div>
-         <div><span class="wk">Footprint</span><span class="wv">${d.w}×${d.d}</span></div>
+         <div><span class="wk">Perk</span><span class="wv" style="font-size:10px">${perk}</span></div>
        </div>
-       <div class="winsp-actions">
-         <button class="btn primary" onclick="MarqueWorld.studioAction()">Design / Redesign ▸</button>
+       ${modelRows}
+       <div class="winsp-actions" style="margin-top:10px">
+         <button class="btn primary" onclick="MarqueWorld.studioAction()">Full Studio ▸</button>
          ${upCost!=null
-           ? `<button class="btn" ${canUp?'':'disabled'} onclick="MarqueWorld.upgradeSelected()">Upgrade to L${o.level+1} · $${upCost}M</button>`
+           ? `<button class="btn" ${canUp?'':'disabled'} onclick="MarqueWorld.upgradeSelected()">Upgrade · $${upCost}M</button>`
            : `<button class="btn" disabled>Max level</button>`}
          <button class="btn danger" onclick="MarqueWorld.demolishSelected()">Demolish</button>
        </div>`;
+    if(opts.onInspectorUpdated) opts.onInspectorUpdated(o.id);
     return;
   }
   const d=def(o.type), cap=capacityOf(o), util=cap>0?Math.round(clamp(o.lastOutput/cap,0,1)*100):0;
@@ -2065,6 +1540,7 @@ function renderInspector(){
          : `<button class="btn" disabled>Max level</button>`}
        <button class="btn danger" ${canDem?'':'disabled'} onclick="MarqueWorld.demolishSelected()" title="${canDem?'':'Keep at least one plant'}">Demolish</button>
      </div>`;
+  if(opts.onInspectorUpdated) opts.onInspectorUpdated(o.id);
 }
 
 // ── public actions wired to DOM ──────────────────────────────────────────────
@@ -2098,6 +1574,7 @@ function setLabFocus(id, focus){
 function step(dt){
   wT += dt;
   if(flashT>0){ flashT-=dt; if(flashT<=0){ flashT=0; renderMenu(); } }
+  stepAgents(dt);
 }
 let last=0;
 function loop(now){
@@ -2151,13 +1628,14 @@ return {
   // lifecycle / shell wiring
   init, getCampus, loadCampus, resetCampus, step, render, renderPanels,
   toggleBuild, upgradeSelected, demolishSelected, studioAction, setLabFocus,
+  // new in rebuild
+  setSimState, getSelectedBuildingScreenPos,
 };
 
 })();
-
 </script>
 <style>
-  :root{
+:root{
     --bg:#15171C; --panel:#1D2026; --panel2:#22262E; --line:#2E333D;
     --hi:#ECEEF1; --dim:#8A9099; --dimmer:#5C636E;
     --amber:#F2A33C; --green:#4FD08A; --red:#E5605E;
@@ -2193,8 +1671,7 @@ return {
   .gauge .delta{font-family:var(--mono);font-size:11px;margin-top:5px}
 
   /* ── layout ── */
-  .grid{display:grid;grid-template-columns:1.55fr 1fr;gap:18px;align-items:start}
-  @media(max-width:900px){.grid{grid-template-columns:1fr}.cluster{grid-template-columns:repeat(2,1fr)}}
+  @media(max-width:900px){.cluster{grid-template-columns:repeat(2,1fr)}}
   .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:18px}
   .panel h2{font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--dim);margin:0 0 14px;font-weight:600;font-family:var(--mono)}
 
@@ -2263,12 +1740,9 @@ return {
     border-top:1px solid var(--line);padding-top:12px;margin-top:4px}
   .rd-total b{font-weight:600}
 
-  /* ── factory ── */
-  .factory-row{display:flex;align-items:center;gap:12px;margin-bottom:10px}
-  .factory-stat{font-family:var(--mono);font-size:12px;color:var(--dim);white-space:nowrap}
-  .factory-stat b{color:var(--hi)}
-  .cap-bar{flex:1;height:6px;background:var(--line);border-radius:3px;overflow:hidden}
-  .cap-bar i{display:block;height:100%;border-radius:3px;transition:width .3s}
+  /* ── factory brief (compact capacity line in lineup tab) ── */
+  .factory-brief{font-family:var(--mono);font-size:11px;color:var(--dim);
+    padding:0 0 12px;border-bottom:1px solid var(--line);margin-bottom:14px}
 
   /* ── chart ── */
   svg.chart{width:100%;height:150px;display:block}
@@ -2325,27 +1799,36 @@ return {
   .end-actions .primary-end{background:var(--amber);color:#10141C;border-color:var(--amber);font-weight:700}
   .end-actions .primary-end:hover{filter:brightness(1.08);color:#10141C}
 
-  /* ── campus builder (PART B) ── */
-  .campus{display:grid;grid-template-columns:1.7fr 1fr;gap:14px;margin-bottom:18px;align-items:stretch}
-  @media(max-width:760px){.campus{grid-template-columns:1fr}}
-  .campus-grid{position:relative;height:300px;border-radius:12px;overflow:hidden;
-    background:#0C0F15;border:1px solid var(--line)}
+  /* ── world view — the single unified live surface ── */
+  .world-view{position:relative;width:100%;height:clamp(340px,calc(100vh - 360px),560px);
+    border-radius:12px;overflow:hidden;background:#0C0F15;border:1px solid var(--line);margin-bottom:14px}
+  .world-view.world-armed{border-color:rgba(242,163,60,.65)!important;
+    box-shadow:0 0 0 3px rgba(242,163,60,.18)}
   #worldCanvas{position:absolute;inset:0;width:100%;height:100%;display:block}
-  .campus-title{position:absolute;top:8px;left:12px;font-family:var(--mono);font-size:9px;
-    letter-spacing:.18em;text-transform:uppercase;color:var(--dim);z-index:2}
-  .campus-side{display:flex;flex-direction:column;gap:12px}
-  .campus-panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
-  .campus-panel h3{font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--dim);
-    margin:0 0 10px;font-weight:600;font-family:var(--mono)}
-  .wbuild-btn{width:100%;font-family:var(--mono);font-size:12px;font-weight:600;
-    display:flex;justify-content:space-between;align-items:center;
-    background:var(--amber);color:#10141C;border:none;border-radius:8px;padding:10px 12px;
-    cursor:pointer;transition:.12s}
+  .world-toolbar{position:absolute;bottom:0;left:0;right:0;
+    background:rgba(21,23,28,.86);backdrop-filter:blur(6px);
+    padding:9px 14px;border-top:1px solid var(--line);
+    display:flex;gap:8px;align-items:center;flex-wrap:wrap;z-index:3}
+
+  /* ── world inspector popup + hover tooltip (fixed overlays) ── */
+  .world-inspector{position:fixed;background:rgba(26,29,36,.97);border:1px solid var(--line);
+    border-radius:11px;padding:13px 14px;width:248px;
+    font-family:var(--mono);font-size:11px;z-index:200;pointer-events:auto;
+    box-shadow:0 6px 22px rgba(0,0,0,.5);overflow-y:auto;max-height:80vh}
+  .world-tooltip{position:fixed;background:rgba(21,23,28,.93);border:1px solid var(--line);
+    border-radius:6px;padding:5px 9px;font-family:var(--mono);font-size:10px;
+    pointer-events:none;z-index:201;white-space:nowrap}
+
+  /* ── campus builder UI (build toolbar + inspector) ── */
+  .wbuild-btn{font-family:var(--mono);font-size:12px;font-weight:600;
+    display:inline-flex;align-items:center;gap:6px;
+    background:var(--amber);color:#10141C;border:none;border-radius:8px;padding:8px 12px;
+    cursor:pointer;transition:.12s;white-space:nowrap}
   .wbuild-btn.on{background:transparent;color:var(--amber);border:1px solid var(--amber)}
   .wbuild-btn:hover{filter:brightness(1.05)}
   .wbuild-btn:disabled{opacity:.35;cursor:not-allowed}
-  .wbuild-btn span{font-weight:400}
-  .wbuild-hint{font-family:var(--mono);font-size:10px;color:var(--dimmer);margin-top:9px;line-height:1.6}
+  .wbuild-btn span{font-weight:400;font-size:11px}
+  .wbuild-hint{font-family:var(--mono);font-size:10px;color:var(--dimmer);line-height:1.6;flex:1;min-width:160px}
   .wbuild-hint b{color:var(--hi)}
   .winsp-empty{font-family:var(--mono);font-size:11px;color:var(--dimmer);padding:6px 0}
   .winsp-name{font-weight:700;font-size:14px;margin-bottom:10px}
@@ -2357,38 +1840,16 @@ return {
   .winsp-actions{display:flex;gap:6px;flex-wrap:wrap}
   .winsp-note{font-family:var(--mono);font-size:9px;color:var(--dimmer);margin-top:9px;letter-spacing:.04em}
 
-  /* ── factory hero ── */
-  .factory-hero{position:relative;width:100%;height:160px;border-radius:12px;
-    overflow:hidden;background:#0C0F15;margin-bottom:10px;border:1px solid var(--line)}
-  .factory-readout-lbl{position:absolute;top:8px;left:12px;font-family:var(--mono);
-    font-size:9px;letter-spacing:.18em;text-transform:uppercase;color:var(--dimmer);
-    z-index:2;pointer-events:none}
-
-  /* ── campus section heading ── */
-  .campus-hdr{display:flex;align-items:baseline;gap:12px;margin-bottom:5px}
-  .campus-hdr-title{font-size:14px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;color:var(--hi)}
-  .campus-hdr-sub{font-family:var(--mono);font-size:10px;color:var(--dim)}
-  .campus-hint{font-family:var(--mono);font-size:10px;color:var(--dimmer);padding:0 0 9px;letter-spacing:.03em}
-  /* armed state: glow the grid so new players know THAT is where they click */
-  .campus.campus-armed .campus-grid{border-color:rgba(242,163,60,.65)!important;
-    box-shadow:0 0 0 3px rgba(242,163,60,.18)}
-  #factoryCanvas{position:absolute;inset:0;width:100%;height:100%;display:block}
-  .factory-hud{position:absolute;bottom:0;left:0;right:0;
-    display:flex;justify-content:space-between;align-items:center;
-    padding:8px 14px;
-    background:linear-gradient(transparent,rgba(12,15,21,.82))}
-  .fhud-stat{font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:.07em}
-  .fhud-bar{display:flex;gap:6px;align-items:center}
-  .flbl{font-family:var(--mono);font-size:9px;color:var(--dimmer);
-    letter-spacing:.15em;text-transform:uppercase}
-  .fgrp{display:flex;gap:3px;padding:0 4px}
-  .fgrp+.fgrp{border-left:1px solid rgba(255,255,255,.08)}
-  .fgrp button{font-family:var(--mono);font-size:11px;background:transparent;
-    color:var(--dimmer);border:1px solid transparent;border-radius:7px;
-    padding:5px 9px;cursor:pointer;transition:.12s}
-  .fgrp button:hover{color:var(--hi)}
-  .fgrp button.on{background:rgba(242,163,60,.14);color:var(--amber);
-    border-color:rgba(242,163,60,.28)}
+  /* ── dashboard tabs ── */
+  .dashboard{margin-bottom:14px}
+  .dash-tabs{display:flex;border-bottom:1px solid var(--line)}
+  .dash-tab{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;
+    background:transparent;color:var(--dim);border:none;border-bottom:2px solid transparent;
+    padding:9px 16px;cursor:pointer;transition:.12s;margin-bottom:-1px}
+  .dash-tab:hover{color:var(--hi)}
+  .dash-tab.active{color:var(--amber);border-bottom-color:var(--amber)}
+  .dash-panel{background:var(--panel);border:1px solid var(--line);border-top:none;
+    border-radius:0 0 12px 12px;padding:18px;max-height:520px;overflow-y:auto}
 
   /* ── launch screen ── */
   #launchOverlay,#studioOverlay{position:fixed;inset:0;z-index:100;background:rgba(10,12,18,.94);
@@ -2444,6 +1905,7 @@ return {
 </style>
 </head>
 <body>
+
 <header>
   <div class="brandmark">
     <div class="nm">Marque<span class="dot">.</span></div>
@@ -2456,68 +1918,33 @@ return {
   </div>
   <div class="cluster" id="cluster"></div>
 </header>
-<!-- factory hero — always visible, live readout of sim state; read-only, not the build surface -->
-<div class="factory-hero">
-  <div class="factory-readout-lbl">Factory Line · readout</div>
-  <canvas id="factoryCanvas"></canvas>
-  <div class="factory-hud">
-    <div class="fhud-stat" id="fhudStat">—</div>
-    <div class="fhud-bar">
-      <span class="flbl">Line</span>
-      <div class="fgrp">
-        <button data-fspd="0.5">0.5×</button>
-        <button data-fspd="1" class="on">1×</button>
-        <button data-fspd="2">2×</button>
-      </div>
-      <div class="fgrp">
-        <button id="fDnBtn">Dusk</button>
-      </div>
-    </div>
-  </div>
-</div>
-<!-- campus builder: the primary build surface. Click a build button, then a tile. -->
-<div class="campus-hdr">
-  <span class="campus-hdr-title">Plant Campus</span>
-  <span class="campus-hdr-sub">Buildings here set factory capacity each quarter</span>
-</div>
-<div class="campus-hint">Click a build button, then click a tile here to place.</div>
-<div class="campus" id="campusArea">
-  <div class="campus-grid">
-    <canvas id="worldCanvas"></canvas>
-  </div>
-  <div class="campus-side">
-    <div class="campus-panel"><h3>Build</h3><div id="worldMenu"></div></div>
-    <div class="campus-panel"><h3>Inspector</h3><div id="worldInspector"></div></div>
-  </div>
+<!-- unified world canvas — the primary build and watch surface -->
+<div class="world-view" id="worldView">
+  <canvas id="worldCanvas"></canvas>
+  <div class="world-toolbar" id="worldMenu"></div>
 </div>
 <div id="goalBanner"></div>
 
-<div class="grid">
-  <div class="col-left">
-    <div class="panel">
-      <h2>Lineup · design &amp; price your models</h2>
-      <div id="segments"></div>
-      <div class="hint">Design a car per segment: pick engine + trim, set price, advance each quarter. Engine matters: V8 wins Coupe buyers on performance; I4 wins Sedan on efficiency. Rivals react every quarter. Refresh to reset novelty before it fades.</div>
-    </div>
+<!-- dashboard tabs — secondary panels -->
+<div class="dashboard">
+  <div class="dash-tabs">
+    <button class="dash-tab active" data-tab="lineup" onclick="setDashTab('lineup')">Lineup</button>
+    <button class="dash-tab" data-tab="rd" onclick="setDashTab('rd')">R&amp;D</button>
+    <button class="dash-tab" data-tab="market" onclick="setDashTab('market')">Market</button>
+    <button class="dash-tab" data-tab="log" onclick="setDashTab('log')">Log</button>
   </div>
-  <div class="col-right">
-    <div class="panel">
-      <h2>R&amp;D · plan this quarter</h2>
-      <div id="rd"></div>
-    </div>
-    <div class="panel" id="factoryPanel">
-      <h2>Factory</h2>
-      <div id="factory"></div>
-    </div>
-    <div class="panel">
-      <h2>Overall market share</h2>
-      <svg class="chart" id="chart" viewBox="0 0 320 150" preserveAspectRatio="none"></svg>
-      <div class="leg" id="chartleg"></div>
-    </div>
-    <div class="panel">
-      <h2>Quarterly report</h2>
-      <div class="log" id="log"></div>
-    </div>
+  <div class="dash-panel" id="dashLineup">
+    <div class="factory-brief" id="factoryBrief"></div>
+    <div id="segments"></div>
+    <div class="hint">Design a car per segment: pick engine + trim, set price, advance each quarter. Engine matters: V8 wins Coupe buyers on performance; I4 wins Sedan on efficiency. Rivals react every quarter. Refresh to reset novelty before it fades.</div>
+  </div>
+  <div class="dash-panel" id="dashRD" style="display:none"><div id="rd"></div></div>
+  <div class="dash-panel" id="dashMarket" style="display:none">
+    <svg class="chart" id="chart" viewBox="0 0 320 150" preserveAspectRatio="none"></svg>
+    <div class="leg" id="chartleg"></div>
+  </div>
+  <div class="dash-panel" id="dashLog" style="display:none">
+    <div class="log" id="log"></div>
   </div>
 </div>
 
@@ -2531,7 +1958,9 @@ return {
 <div id="studioOverlay"></div>
 <!-- first-run tutorial checklist — dismissible, localStorage-persisted -->
 <div id="tutCard" style="display:none"></div>
-
+<!-- world inspector popup and tooltip — fixed-position, positioned by updateInspectorPopup() -->
+<div class="world-inspector" id="worldInspector" style="display:none"></div>
+<div class="world-tooltip" id="worldTooltip" style="display:none"></div>
 <script>
 /* ── global state ─────────────────────────────────────────────────────────── */
 let st;
@@ -2570,7 +1999,7 @@ function loadGame(){
     _lastCash = st.companies.find(c=>c.player).cash;
     _lastShare = st.lastOverall*100;
     _lastBrand = st.companies.find(c=>c.player).brand*100;
-    MarqueFactory.update(st, { hasRecall:false });
+    if(typeof MarqueWorld!=='undefined') MarqueWorld.setSimState(st);
     render();
     return true;
   } catch(e){ console.error('loadGame error', e); return false; }
@@ -2597,23 +2026,75 @@ function initCampus(){
     getCash: () => st ? st.companies.find(c=>c.player).cash : 0,
     onSpend: (amt) => { if(st) st.companies.find(c=>c.player).cash -= amt; },
     onChange: () => { applyCampusToSim(); render(); saveGame(); },
-    // focus the factory interior on the selected plant's output (null = whole company)
-    onSelect: (obj) => { if(typeof MarqueFactory!=='undefined') MarqueFactory.setFocus(obj ? obj.lastOutput : null); },
-    // a Design Studio is the home of the car-design flow (click it, or its inspector button)
+    onArmChange: (armed) => document.getElementById('worldView').classList.toggle('world-armed', armed),
     onStudioOpen: () => openStudio(studioSel ? studioSel.segId : null),
     getStudioStatus: () => studioSel ? ('Designing ' + (SEGS.find(s=>s.id===studioSel.segId)?.name||'')) : 'Idle',
+    getActiveModels: () => {
+      if(!st) return [];
+      const player = st.companies.find(c=>c.player);
+      return player.models.filter(m=>m.active).map(m=>{
+        const s = SEGS.find(sg=>sg.id===m.segId)||{name:m.segId,refPrice:25};
+        return { segId:m.segId, name:s.name, price:m.price,
+                 floor:+(m.cost*1.02).toFixed(1), ceil:+(s.refPrice*1.65).toFixed(1),
+                 nov:Math.round(m.novelty*100) };
+      });
+    },
+    onHoverTip: (html, cx, cy) => {
+      const tt = document.getElementById('worldTooltip');
+      if(!html){ tt.style.display='none'; return; }
+      const rect = document.getElementById('worldCanvas').getBoundingClientRect();
+      tt.innerHTML = html; tt.style.display='block';
+      tt.style.left = (rect.left+cx+14)+'px';
+      tt.style.top  = (rect.top+cy-28)+'px';
+    },
+    onInspectorUpdated: (selId) => updateInspectorPopup(selId),
   });
 }
 // arm the Design Studio build tool and bring the campus into view (the one-click
 // path offered by the locked state in segment cards)
 function armStudioBuild(){
   if(typeof MarqueWorld!=='undefined') MarqueWorld.toggleBuild('studio');
-  const c = document.querySelector('.campus');
-  if(c) c.scrollIntoView({ behavior:'smooth', block:'center' });
+  const wv = document.getElementById('worldView');
+  if(wv) wv.scrollIntoView({ behavior:'smooth', block:'center' });
 }
 function refreshRunButtons(){
   const cont = document.getElementById('continueBtn');
   if(cont) cont.disabled = !hasSave();
+}
+
+/* ── dashboard tab switching ────────────────────────────────────────────── */
+function setDashTab(tab){
+  document.querySelectorAll('.dash-tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));
+  ['dashLineup','dashRD','dashMarket','dashLog'].forEach(id=>{
+    const el=document.getElementById(id); if(el) el.style.display='none';
+  });
+  const map={lineup:'dashLineup',rd:'dashRD',market:'dashMarket',log:'dashLog'};
+  const target=document.getElementById(map[tab]||'dashLineup');
+  if(target) target.style.display='block';
+}
+
+/* ── world inspector popup positioning ──────────────────────────────────── */
+function updateInspectorPopup(selId){
+  const popup = document.getElementById('worldInspector');
+  if(!selId){ popup.style.display='none'; return; }
+  if(typeof MarqueWorld==='undefined'){ popup.style.display='none'; return; }
+  const pos = MarqueWorld.getSelectedBuildingScreenPos();
+  if(!pos){ popup.style.display='none'; return; }
+  const rect = document.getElementById('worldCanvas').getBoundingClientRect();
+  popup.style.display='block';
+  const pageX=rect.left+pos.x, pageY=rect.top+pos.y;
+  const popW=260;
+  let left=pageX+14;
+  if(left+popW>window.innerWidth-8) left=pageX-popW-14;
+  popup.style.left=Math.max(4,left)+'px';
+  popup.style.top=Math.max(4,Math.min(pageY-24,window.innerHeight-240))+'px';
+}
+
+/* ── model price update from world inspector ────────────────────────────── */
+function worldSetModelPrice(segId, price){
+  if(!st) return;
+  const m=st.companies.find(c=>c.player).models.find(m=>m.segId===segId&&m.active);
+  if(m){ m.price=price; saveGame(); }
 }
 
 /* ── formatting ─────────────────────────────────────────────────────────── */
@@ -2757,7 +2238,7 @@ function confirmLaunch(){
   }
   st.launchFlow = false;
   document.getElementById('launchOverlay').style.display = 'none';
-  MarqueFactory.update(st, { hasRecall: false });
+  if(typeof MarqueWorld!=='undefined') MarqueWorld.setSimState(st);
   render();
   saveGame();
 }
@@ -2790,9 +2271,9 @@ function render(){
   _lastCash=player.cash; _lastShare=ov; _lastBrand=player.brand*100;
 
   renderGoalBanner();
+  renderFactory();
   renderSegments();
   renderRD();
-  renderFactory();
   renderChart();
   renderLog();
 
@@ -3033,45 +2514,22 @@ function renderRD(){
   wrap.appendChild(tot);
 }
 
-/* ── factory ─────────────────────────────────────────────────────────── */
+/* ── factory brief — compact summary at top of Lineup tab ─────────────── */
 function renderFactory(){
+  const el = document.getElementById('factoryBrief');
+  if(!el || !st) return;
   const player = st.companies.find(c=>c.player);
   const cap = player.factory.capacity;
   const projDemand = SEGS.reduce((sum,s)=>{
     const sh = segShares(s.id,st)['you']; return sum+(sh?sh.units:0);
   },0);
-  const util = Math.min(projDemand/cap, 1);
   const bottleneck = projDemand > cap*0.92;
-  const barColor = bottleneck ? 'var(--red)' : 'var(--amber)';
-  const canUpgrade = player.cash >= C.capacityUpgradeCost;
   const activeCount = player.models.filter(m=>m.active).length;
-  const plantCarry  = Math.round(C.capacityCarry*cap);
-  const overhead    = Math.round(C.overheadBase + C.overheadPerModel*activeCount + plantCarry);
-  document.getElementById('factory').innerHTML = `
-    <div class="factory-row">
-      <div class="factory-stat">Capacity: <b>${cap}k</b>/q</div>
-      <div class="cap-bar"><i style="width:${Math.round(util*100)}%;background:${barColor}"></i></div>
-      <div class="factory-stat" style="color:${bottleneck?'var(--red)':'var(--dim)'}">
-        <b>${Math.round(projDemand)}k</b> proj.
-      </div>
-    </div>
-    <div class="factory-stat" style="margin-bottom:10px;font-size:11px">
-      Overhead <b>$${overhead}M</b>/q &nbsp;<span class="dim">= base $${C.overheadBase} + ${activeCount} model${activeCount!==1?'s':''} ($${C.overheadPerModel} ea) + plant $${plantCarry}</span>
-      ${bottleneck?`<span style="color:var(--red)"> · capacity is throttling your sales</span>`:''}
-    </div>
-    <div class="factory-stat" style="font-size:11px;color:var(--dim)">
-      Capacity is set by your <b style="color:var(--hi)">Plant Campus</b> above — build or upgrade an Assembly Plant to expand it.
-    </div>`;
-  // sync factory hero HUD stat line
-  const fhudEl = document.getElementById('fhudStat');
-  if(fhudEl){
-    const activeModels = player.models.filter(m => m.active);
-    const lastModel = activeModels[activeModels.length - 1];
-    const building = lastModel
-      ? `${ENGINES[lastModel.engId].name} ${SEGS.find(s=>s.id===lastModel.segId)?.name}`
-      : '—';
-    fhudEl.innerHTML = `${cap}k cap &nbsp;·&nbsp; <span style="${bottleneck?'color:var(--red)':''}">${Math.round(projDemand)}k proj</span> &nbsp;·&nbsp; Building: <b>${building}</b>`;
-  }
+  const overhead = Math.round(C.overheadBase + C.overheadPerModel*activeCount + Math.round(C.capacityCarry*cap));
+  el.innerHTML = `Factory: <b>${cap}k</b>/q · Proj: <b style="color:${bottleneck?'var(--red)':'var(--hi)'}">${Math.round(projDemand)}k</b>`
+    + ` · Overhead: <b>$${overhead}M</b>/q`
+    + (bottleneck?` &nbsp;<span style="color:var(--red)">⚠ capacity throttling sales</span>`:'')
+    + ` &nbsp;<span style="color:var(--dimmer)">— build/upgrade Assembly Plants to expand</span>`;
 }
 
 /* ── chart ────────────────────────────────────────────────────────────── */
@@ -3268,10 +2726,7 @@ function doAdvance(){
                        mfg: pendingRD.mfg + (campusRD.mfg||0) },
                   factoryUpgrade:false });
     studioSel=null;
-    // detect recall (recallQ === recallDuration means it just fired this quarter)
-    const player = st.companies.find(c=>c.player);
-    const hasRecall = player.models.some(m => m.active && m.recallQ === C.recallDuration);
-    MarqueFactory.update(st, { hasRecall });
+    if(typeof MarqueWorld!=='undefined') MarqueWorld.setSimState(st);
     if(typeof MarqueWorld!=='undefined'){
       MarqueWorld.applyProduction(MarqueWorld.getCampus(), st.lastUnits);
       MarqueWorld.renderPanels();
@@ -3434,7 +2889,6 @@ function startNew(){
 }
 
 /* boot — resume the saved run if there is one, otherwise start fresh */
-MarqueFactory.init(document.getElementById('factoryCanvas'));
 initCampus();
 if(!loadGame()) startNew();
 refreshRunButtons();
@@ -3446,19 +2900,6 @@ document.getElementById('newRunBtn').onclick = () => {
 };
 document.getElementById('continueBtn').onclick = () => {
   if(!loadGame()) alert('No saved run found.');
-};
-
-/* factory hero controls */
-let _factNight = false;
-document.querySelectorAll('[data-fspd]').forEach(b => b.onclick = () => {
-  MarqueFactory.setViewSpeed(parseFloat(b.dataset.fspd));
-  document.querySelectorAll('[data-fspd]').forEach(x => x.classList.remove('on'));
-  b.classList.add('on');
-});
-document.getElementById('fDnBtn').onclick = function(){
-  _factNight = !_factNight;
-  MarqueFactory.setNight(_factNight);
-  this.textContent = _factNight ? 'Day' : 'Dusk';
 };
 </script>
 </body>
