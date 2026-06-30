@@ -1,0 +1,3230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MARQUE · Auto Company Sim</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script>
+/* marque-sim.js — MARQUE simulation engine, era 1994–2010
+   Pure JS, no DOM. Exposes window.MarqueSim.
+   State is mutated in-place; serialise with JSON.stringify.        */
+
+const MarqueSim = (() => {
+'use strict';
+
+// ── tunables ─────────────────────────────────────────────────────────────────
+// Balance philosophy (see BALANCE_NOTES.md): margins are thin, fixed costs
+// scale with the size of the company, and covering the whole market is a real
+// multi-year financial commitment — so cash compounds slowly and the share
+// goal is earned by out-developing rivals over time, not by mere presence.
+const C = {
+  startYear: 1990, startCash: 400,
+  // operating costs — overhead is no longer a flat fee; it grows with the
+  // company so a sprawling, high-capacity automaker carries real burden.
+  overheadBase: 40,          // $M/q fixed corporate cost
+  overheadPerModel: 30,      // $M/q per active model (engineering, marketing)
+  capacityCarry: 0.20,       // $M/q per k-unit of standing capacity
+  noveltyDecay: 0.90,
+  designBase: 30,            // $M + engine/trim adders (was 16 — tooling is real)
+  segmentLaunchCost: 130,    // $M one-time to ENTER a new segment (plant/tooling)
+  refreshBase: 26,           // $M, scales with seg.refPrice/22
+  capacityStart: 180,        // k units / quarter
+  capacityStep: 55,
+  capacityUpgradeCost: 130,  // $M
+  rdEffort: 1150,            // higher → R&D pays off slower, feels expensive early
+  qualityCap: 0.44, featCap: 0.40,
+  effBonusCap: 0.18, perfBonusCap: 0.20,
+  mfgCostCut: 0.12,          // was 0.28 — cost cuts no longer balloon margins
+  // Skill expression: share is a softmax over appeal^gamma, so a genuinely
+  // better product wins decisively more share (gamma>1) instead of the field
+  // bunching at ~25%. Brand is responsive — it BUILDS fast when your product
+  // (quality + freshness + halo) leads the field, and fades slowly when you coast.
+  appealGamma: 1.7,          // share = softmax over appeal^gamma (skill → decisive share)
+  gammaRampQ: 22,            // gamma ramps 1→appealGamma over these quarters: an early
+                             // market is bunched near parity, then a superior product
+                             // pulls away — so no one runs away to a win before ~1994
+  brandRiseRate: 0.075,      // brand climbs toward its target at this rate when leading
+  brandFallRate: 0.030,      // and erodes at this (slower) rate when behind/coasting
+  // Shareholder dividend sweep: excess cash above a healthy operating reserve
+  // is returned to owners each quarter. The objective is market share, not a
+  // cash pile — this keeps the numbers legible, makes idle hoarding pointless,
+  // and stops a profitable company from ballooning into the stratosphere. It
+  // never touches cash you actually need: early play sits below the reserve and
+  // pays nothing, and the reserve always covers design + launch + a full R&D
+  // quarter.
+  cashReserveSoft: 650,      // $M — sweep only takes cash above this
+  dividendRate: 0.45,        // fraction of the excess returned each quarter
+  haloBump: 0.008,           // per-quarter brand gain from V8/V12 coupe (tunable)
+  recallRiskBase: 0.014,
+  recallDuration: 3,
+  recallHitMin: 26, recallHitMax: 70,
+};
+
+// ── engines ───────────────────────────────────────────────────────────────────
+const ENGINES = {
+  I4:     { name:'I4',     perf:0.20, eff:0.72, costAdd:0,    fits:['sedan','suv','pickup'], unlock:1990 },
+  V6:     { name:'V6',     perf:0.44, eff:0.54, costAdd:2.5,  fits:['sedan','suv','pickup','coupe'], unlock:1990 },
+  V8:     { name:'V8',     perf:0.68, eff:0.34, costAdd:5.5,  fits:['sedan','suv','pickup','coupe'], unlock:1990 },
+  V12:    { name:'V12',    perf:0.88, eff:0.17, costAdd:13.0, fits:['coupe'], unlock:1992 },
+  hybrid: { name:'Hybrid', perf:0.38, eff:0.84, costAdd:7.5,  fits:['sedan','suv'], unlock:1997 },
+  ev:     { name:'EV',     perf:0.47, eff:0.94, costAdd:12.0, fits:['sedan'], unlock:2001 },
+};
+
+const TRIMS = {
+  base: { name:'Base', featAdd:0.00, costAdd:0,   priceAdd:0   },
+  mid:  { name:'Mid',  featAdd:0.14, costAdd:2.5, priceAdd:3.2 },
+  high: { name:'High', featAdd:0.26, costAdd:5.8, priceAdd:8.0 },
+};
+
+// ── segments ──────────────────────────────────────────────────────────────────
+const SEGS = [
+  { id:'sedan',  name:'Sedan',  demand:230, refPrice:22, spread:4.2, baseCost:19.5,
+    w:{ price:.32, quality:.17, brand:.11, eff:.16, feat:.09, perf:.05, nov:.10 } },
+  { id:'suv',    name:'SUV',    demand:165, refPrice:37, spread:7.2, baseCost:33.0,
+    w:{ price:.16, quality:.18, brand:.22, eff:.07, feat:.17, perf:.12, nov:.08 } },
+  { id:'pickup', name:'Pickup', demand:140, refPrice:31, spread:5.8, baseCost:27.0,
+    w:{ price:.20, quality:.14, brand:.15, eff:.09, feat:.12, perf:.22, nov:.08 } },
+  { id:'coupe',  name:'Coupe',  demand: 85, refPrice:36, spread:6.8, baseCost:30.5,
+    w:{ price:.08, quality:.12, brand:.20, eff:.03, feat:.14, perf:.30, nov:.13 } },
+];
+
+const PERSONAS = {
+  player:      { priceBias:0,    rdBias:{eng:.33,eff:.33,mfg:.34}, prefEng:{sedan:'I4',suv:'V6',pickup:'V6',coupe:'V8'}, prefTrim:'mid' },
+  value:       { priceBias:-.10, rdBias:{eng:.20,eff:.30,mfg:.50}, prefEng:{sedan:'I4',suv:'I4',pickup:'I4',coupe:'V6'}, prefTrim:'base' },
+  premium:     { priceBias:+.16, rdBias:{eng:.45,eff:.15,mfg:.40}, prefEng:{sedan:'V6',suv:'V8',pickup:'V8',coupe:'V8'}, prefTrim:'high' },
+  performance: { priceBias:+.06, rdBias:{eng:.60,eff:.10,mfg:.30}, prefEng:{sedan:'V8',suv:'V8',pickup:'V8',coupe:'V12'}, prefTrim:'mid' },
+};
+
+// ── seeded RNG (mulberry32, serialisable) ─────────────────────────────────────
+function rand(st) {
+  st.rngState = (st.rngState + 0x6D2B79F5) >>> 0;
+  let t = Math.imul(st.rngState ^ st.rngState >>> 15, 1 | st.rngState);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+  return ((t ^ t >>> 14) >>> 0) / 4294967296;
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+const clamp = (v,a,b) => Math.max(a, Math.min(b,v));
+const lerp  = (a,b,t) => a + (b-a)*t;
+const getSeg = id => SEGS.find(s => s.id===id);
+
+function modelBaseCost(segId, engId, trimId) {
+  return +(getSeg(segId).baseCost + ENGINES[engId].costAdd + TRIMS[trimId].costAdd).toFixed(1);
+}
+
+function makeModel(segId, engId, trimId, persona) {
+  const s = getSeg(segId);
+  const per = PERSONAS[persona] || PERSONAS.player;
+  const price = +(s.refPrice*(1+per.priceBias) + ENGINES[engId].costAdd*0.55 + TRIMS[trimId].priceAdd).toFixed(1);
+  return {
+    segId, engId, trimId,
+    price,
+    cost: modelBaseCost(segId, engId, trimId),
+    quality: 0.50,
+    feat: clamp(0.50 + TRIMS[trimId].featAdd, 0, 1),
+    novelty: 0.74,
+    recallQ: 0,
+    active: true,
+    lastShare: 0, lastUnits: 0, totalUnits: 0,
+  };
+}
+
+// ── appeal ────────────────────────────────────────────────────────────────────
+const logistic  = x => 1/(1+Math.exp(x));
+const priceScore = (price, s) => logistic((price - s.refPrice) / s.spread);
+
+function coPerf(co, engId) {
+  return clamp(ENGINES[engId].perf + C.perfBonusCap*(1-Math.exp(-co.rd.eng/C.rdEffort)), 0, 1);
+}
+function coEff(co, engId) {
+  return clamp(ENGINES[engId].eff + C.effBonusCap*(1-Math.exp(-co.rd.eff/C.rdEffort)), 0, 1);
+}
+
+function appeal(m, s, co) {
+  const w = s.w;
+  const a = w.price   * priceScore(m.price, s)
+          + w.quality * m.quality
+          + w.brand   * co.brand
+          + w.eff     * coEff(co, m.engId)
+          + w.feat    * m.feat
+          + w.perf    * coPerf(co, m.engId)
+          + w.nov     * m.novelty
+          - (m.recallQ > 0 ? 0.12 : 0);
+  return Math.max(0.01, a);
+}
+
+// How good a company's lineup actually is right now: quality + freshness, with a
+// genuine-prestige bump for a halo coupe. Drives the responsive brand model.
+function productStrength(co) {
+  const ms = co.models.filter(m=>m.active);
+  if (!ms.length) return 0.30;
+  let s = 0;
+  ms.forEach(m => { s += 0.62*m.quality + 0.38*m.novelty; });
+  s /= ms.length;
+  if (ms.find(m => m.segId==='coupe' && (m.engId==='V8'||m.engId==='V12'))) s += 0.06;
+  return clamp(s, 0, 1);
+}
+
+// returns { [coId]: { share, units } } for a segment. Share is a softmax over
+// appeal^gamma — a clearly better product takes decisively more share, instead of
+// the whole field bunching near an even split.
+function segShares(segId, st) {
+  const s = getSeg(segId);
+  // gamma ramps from 1 (even, parity-ish market) up to appealGamma as the decade
+  // matures, so product superiority pulls away over time rather than instantly.
+  const g = 1 + (C.appealGamma - 1) * Math.min(1, (st.tick||0) / C.gammaRampQ);
+  const entries = st.companies
+    .map(co => ({ co, m: co.models.find(m => m.segId===segId && m.active) }))
+    .filter(e => e.m);
+  if (!entries.length) return {};
+  entries.forEach(e => { e.w = Math.pow(appeal(e.m, s, e.co), g); });
+  const tot = entries.reduce((sum,e) => sum + e.w, 0);
+  const dm = (st.demandMult && st.demandMult[segId]) || 1;   // current demand multiplier
+  const out = {};
+  entries.forEach(e => { out[e.co.id] = { share: e.w/tot, units: s.demand*dm*(e.w/tot) }; });
+  return out;
+}
+
+// ── R&D ───────────────────────────────────────────────────────────────────────
+function applyRD(co) {
+  const g   = (prog, cap) => cap*(1-Math.exp(-prog/C.rdEffort));
+  const qGain = 0.50 + g(co.rd.eng, C.qualityCap);
+  const fGain = 0.50 + g(co.rd.eng*0.6, C.featCap);
+  const mMult = 1 - C.mfgCostCut*(1-Math.exp(-co.rd.mfg/C.rdEffort));
+  co.models.filter(m=>m.active).forEach(m => {
+    m.quality = clamp(Math.max(m.quality, qGain), 0, 1);
+    m.feat    = clamp(Math.max(m.feat, fGain + TRIMS[m.trimId].featAdd), 0, 1);
+    m.cost    = +(modelBaseCost(m.segId, m.engId, m.trimId) * mMult).toFixed(1);
+  });
+}
+
+// ── player immediate actions ──────────────────────────────────────────────────
+// These take effect right away; projections update; rivals respond next Advance.
+
+// Cost to put a car on sale = design/tooling for the model, PLUS a one-time
+// plant/tooling launch cost the first time you ENTER a segment you've never
+// occupied. Your founding segment (your first ever model) uses the plant you
+// start with, so it carries no launch surcharge. This makes covering the whole
+// market a deliberate, multi-year investment rather than a free land-grab.
+function designCostOf(engId, trimId) {
+  return Math.round(C.designBase + ENGINES[engId].costAdd*1.4 + TRIMS[trimId].costAdd*1.8);
+}
+function segmentLaunchCostFor(player, segId) {
+  if (!player.launchedSegs) player.launchedSegs = {};
+  const isNewSeg   = !player.launchedSegs[segId];
+  const isFirstEver = Object.keys(player.launchedSegs).length === 0;
+  return (isNewSeg && !isFirstEver) ? C.segmentLaunchCost : 0;
+}
+
+// What a prospective design would cost right now (for the UI). Tells the player
+// up-front whether they're paying the one-time plant/tooling launch surcharge.
+function quoteDesign(st, segId, engId, trimId) {
+  const player = st.companies.find(c=>c.player);
+  const designCost = designCostOf(engId, trimId);
+  const launchCost = segmentLaunchCostFor(player, segId);
+  return { designCost, launchCost, total: designCost + launchCost, isNewSegment: launchCost > 0 };
+}
+
+function playerDesign(st, segId, engId, trimId, price) {
+  const player = st.companies.find(c=>c.player);
+  const designCost = designCostOf(engId, trimId);
+  const launchCost = segmentLaunchCostFor(player, segId);
+  const total = designCost + launchCost;
+  if (player.cash < total) return { ok:false, reason:'Not enough cash.' };
+  const existing = player.models.find(m => m.segId===segId && m.active);
+  if (existing) existing.active = false;
+  player.cash -= total;
+  if (!player.launchedSegs) player.launchedSegs = {};
+  player.launchedSegs[segId] = true;
+  const m = makeModel(segId, engId, trimId, 'player');
+  if (price != null) m.price = price;
+  player.models.push(m);
+  applyRD(player); // boost new model with existing R&D
+  return { ok:true, cost: total, designCost, launchCost, model: m };
+}
+
+function playerRefresh(st, segId) {
+  const player = st.companies.find(c=>c.player);
+  const s = getSeg(segId);
+  const cost = Math.round(C.refreshBase * s.refPrice/22);
+  if (player.cash < cost) return { ok:false, reason:'Not enough cash.' };
+  const m = player.models.find(m2 => m2.segId===segId && m2.active);
+  if (!m) return { ok:false, reason:'No active model.' };
+  player.cash -= cost;
+  m.novelty = 0.86;
+  return { ok:true, cost };
+}
+
+function playerRetire(st, segId) {
+  const m = st.companies.find(c=>c.player).models.find(m2 => m2.segId===segId && m2.active);
+  if (m) m.active = false;
+}
+
+// ── stochastic events (seeded → reproducible per seed; never Math.random) ──────
+// Secular era trends: the 1990s→2000s shift toward SUVs/trucks and away from
+// sedans/coupes. Each segment also takes a small seeded yearly wobble, so the
+// market drifts differently from seed to seed and year to year.
+const SEG_TREND = { sedan:-0.008, suv:+0.016, pickup:+0.006, coupe:-0.006 };
+
+function rollEvents(st, events) {
+  // cost shock eases back toward normal every quarter
+  st.costShockMult = +(1 + (st.costShockMult - 1) * 0.65).toFixed(3);
+  if (Math.abs(st.costShockMult - 1) < 0.012) st.costShockMult = 1;
+  // expire finished rival price wars
+  st.companies.forEach(co => { if (co.priceWar && st.tick >= co.priceWar.until) co.priceWar = null; });
+
+  st.lastEvents = []; st.lastEventTags = [];
+  if (st.quarter !== 1) return;     // the rest roll once a year, at the start of a year
+
+  // 1. demand drift: secular trend + a ±3% seeded wobble per segment
+  SEGS.forEach(s => {
+    const wobble = (rand(st) - 0.5) * 0.06;
+    st.demandMult[s.id] = +clamp(st.demandMult[s.id]*(1 + SEG_TREND[s.id]) + wobble, 0.6, 1.7).toFixed(3);
+  });
+
+  // 2. a segment boom year (occasional)
+  if (rand(st) < 0.20) {
+    const s = SEGS[Math.floor(rand(st) * SEGS.length)];
+    st.demandMult[s.id] = +clamp(st.demandMult[s.id]*1.22, 0.6, 1.9).toFixed(3);
+    const e = `<b>${s.name} boom.</b> Demand for ${s.name.toLowerCase()}s is surging this year.`;
+    events.push(e); st.lastEvents.push(e); st.lastEventTags.push({ kind:'boom', seg:s.id });
+  }
+
+  // 3. supply-cost shock (occasional, only once the industry is established so a
+  //    fragile start-up isn't wiped out) — a margin squeeze that eases in a
+  //    couple of quarters, never a solvency event for a sound company.
+  if (st.year >= 1993 && rand(st) < 0.15) {
+    st.costShockMult = +(1.02 + rand(st)*0.035).toFixed(3);
+    const e = `<b>Supply shock.</b> Material costs jump — unit costs up ~${Math.round((st.costShockMult-1)*100)}% until it eases.`;
+    events.push(e); st.lastEvents.push(e); st.lastEventTags.push({ kind:'shock' });
+  }
+
+  // 4. rival strategy pivot (occasional): a price war, or a halo-coupe push
+  if (rand(st) < 0.22) {
+    const rivals = st.companies.filter(c => !c.player);
+    const co = rivals[Math.floor(rand(st) * rivals.length)];
+    if (rand(st) < 0.55) {
+      const s = SEGS[Math.floor(rand(st) * SEGS.length)];
+      co.priceWar = { seg:s.id, until: st.tick + 5 };
+      const e = `<b>${co.name}</b> opens a <b>price war</b> in ${s.name}.`;
+      events.push(e); st.lastEvents.push(e); st.lastEventTags.push({ kind:'pricewar', seg:s.id, who:co.name });
+    } else {
+      const has = co.models.find(m => m.active && m.segId==='coupe' && (m.engId==='V8'||m.engId==='V12'));
+      if (!has && st.year >= ENGINES.V8.unlock) {
+        const existing = co.models.find(m => m.active && m.segId==='coupe');
+        if (existing) existing.active = false;
+        co.models.push(makeModel('coupe','V8', PERSONAS[co.persona].prefTrim, co.persona));
+        applyRD(co);
+        const e = `<b>${co.name}</b> launches a V8 <b>halo coupe</b> to chase prestige.`;
+        events.push(e); st.lastEvents.push(e); st.lastEventTags.push({ kind:'halo', who:co.name });
+      }
+    }
+  }
+}
+
+// ── rival AI ──────────────────────────────────────────────────────────────────
+function rivalTick(co, st, events) {
+  const per = PERSONAS[co.persona];
+  const rdBudget = clamp(co.cash * 0.22, 0, 160);
+  co.cash -= rdBudget;
+  co.rd.eng += rdBudget * per.rdBias.eng;
+  co.rd.eff += rdBudget * per.rdBias.eff;
+  co.rd.mfg += rdBudget * per.rdBias.mfg;
+  applyRD(co);
+
+  // snapshot prices before adjustments so we can detect meaningful cuts
+  const prevPrices = {};
+  co.models.filter(m=>m.active).forEach(m => prevPrices[m.segId] = m.price);
+  let firedPriceCut = false;  // only one price-cut headline per rival per quarter
+
+  SEGS.forEach(s => {
+    let m = co.models.find(m2 => m2.segId===s.id && m2.active);
+    if (!m) {
+      const eng = per.prefEng[s.id];
+      if (!eng||!ENGINES[eng].fits.includes(s.id)||st.year<ENGINES[eng].unlock) return;
+      co.models.push(makeModel(s.id, eng, per.prefTrim, co.persona));
+      events.push(`<b>${co.name}</b> launches a ${ENGINES[eng].name} ${s.name}.`);
+      return;
+    }
+    if (m.lastShare < 0.17) m.price = +(m.price*0.970).toFixed(1);
+    else if (m.lastShare > 0.38) m.price = +(m.price*1.016).toFixed(1);
+    if (co.persona==='value')       m.price = +(m.price*0.995).toFixed(1);
+    if (co.persona==='premium')     m.price = +(m.price*1.004).toFixed(1);
+    if (co.priceWar && co.priceWar.seg===s.id) m.price = +(m.price*0.95).toFixed(1);  // aggressive undercut
+    const floor = m.cost*1.04, ceil = s.refPrice*(co.persona==='premium'?1.55:1.32);
+    m.price = clamp(m.price, floor, ceil);
+    if (!firedPriceCut && prevPrices[s.id] && m.price < prevPrices[s.id] * 0.97 && m.lastShare < 0.22) {
+      events.push(`<b>${co.name}</b> cuts prices in ${s.name} to fight for share.`);
+      firedPriceCut = true;
+    }
+    if (m.novelty < 0.40 && rand(st) < 0.30) {
+      m.novelty = 0.78; co.cash -= C.refreshBase;
+      events.push(`<b>${co.name}</b> refreshes its ${s.name} lineup.`);
+    }
+  });
+  // Brand is updated uniformly for ALL companies in advance() step 6b (the
+  // responsive model), so rivals no longer adjust brand here.
+}
+
+// ── advance one quarter ───────────────────────────────────────────────────────
+// decisions = { rd:{eng,eff,mfg}, factoryUpgrade:bool }
+// Prices are already set on models directly; design/refresh/retire happened already.
+function advance(st, decisions) {
+  if (st.over) return st;
+  const player = st.companies.find(c=>c.player);
+  const events = [];
+
+  // 0. world events (demand drift, booms, cost shocks, rival pivots) — seeded,
+  //    rolled before rivals act so a pivot takes effect this quarter.
+  rollEvents(st, events);
+
+  // 1. factory upgrade
+  if (decisions.factoryUpgrade && player.cash >= C.capacityUpgradeCost) {
+    player.cash -= C.capacityUpgradeCost;
+    player.factory.capacity += C.capacityStep;
+    events.push(`Factory expanded to <b>${player.factory.capacity}k</b> units/q.`);
+  }
+
+  // 2. R&D
+  const rdSpend = decisions.rd.eng + decisions.rd.eff + decisions.rd.mfg;
+  player.cash -= rdSpend;
+  player.rd.eng += decisions.rd.eng;
+  player.rd.eff += decisions.rd.eff;
+  player.rd.mfg += decisions.rd.mfg;
+  applyRD(player);
+
+  // 3. rivals
+  st.companies.filter(c=>!c.player).forEach(co => rivalTick(co, st, events));
+
+  // 4. market resolution. Appeal → share is computed for everyone; the player
+  //    can only BUILD up to factory capacity, allocated PROPORTIONALLY across
+  //    active models so no segment is starved by ordering. Rivals are abstract
+  //    incumbents with no capacity constraint.
+  let playerProfit = 0, playerUnits = 0;
+  const playerDemand = {};   // segId → unconstrained demand (k units)
+  let totalDemand = 0;
+  SEGS.forEach(s => {
+    const shares = segShares(s.id, st);
+    st.companies.forEach(co => {
+      const e = shares[co.id]; if (!e) return;
+      const m = co.models.find(m2 => m2.segId===s.id && m2.active); if (!m) return;
+      m.lastShare = e.share;
+      if (!co.player) m.lastUnits = e.units;
+    });
+    const pe = shares['you'];
+    if (pe) { playerDemand[s.id] = pe.units; totalDemand += pe.units; }
+  });
+  const cap  = player.factory.capacity;
+  const fill = totalDemand > cap ? cap / totalDemand : 1;   // proportional throttle
+  st.lastCapFill   = +fill.toFixed(3);
+  st.lastDemand    = Math.round(totalDemand);
+  SEGS.forEach(s => {
+    const m = player.models.find(m2 => m2.segId===s.id && m2.active); if (!m) return;
+    const units = (playerDemand[s.id] || 0) * fill;
+    m.lastUnits = units;
+    m.totalUnits = (m.totalUnits || 0) + units;                      // lifetime nameplate sales
+    playerProfit += units * (m.price - m.cost * st.costShockMult);   // supply shocks bite margin
+    playerUnits  += units;
+  });
+
+  // 5. operating costs — overhead scales with the size of the company, so a
+  //    sprawling, high-capacity automaker carries real fixed burden. R&D is a
+  //    real P&L cost too.
+  const activeCount = player.models.filter(m=>m.active).length;
+  const overhead = C.overheadBase
+                 + C.overheadPerModel * activeCount
+                 + C.capacityCarry   * player.factory.capacity;
+  st.lastOverhead = Math.round(overhead);
+  playerProfit -= overhead;
+  playerProfit -= rdSpend;
+  // cash: rdSpend was pre-deducted above; add it back so the net hit is
+  // exactly -overhead -rdSpend (plus the unit margins computed above).
+  player.cash += playerProfit + rdSpend;
+  st.lastProfit = playerProfit; st.lastUnits = playerUnits;
+  st.totalUnits += playerUnits;
+
+  // 6. novelty decay + recalls (rand() order preserved → still deterministic)
+  const recallEvents = [];
+  st.companies.forEach(co => {
+    co.models.filter(m=>m.active).forEach(m => {
+      m.novelty = clamp(m.novelty * C.noveltyDecay, 0.04, 1);
+      if (m.recallQ > 0) m.recallQ--;
+      const risk = C.recallRiskBase*(1 - m.quality);
+      if (rand(st) < risk && m.recallQ===0) {
+        m.recallQ = C.recallDuration;
+        co.brand = clamp(co.brand - 0.06, 0, 1);
+        if (co.player) {
+          const hit = Math.round(C.recallHitMin + (C.recallHitMax-C.recallHitMin)*(1-m.quality));
+          player.cash -= hit;
+          recallEvents.push(`<b>Recall.</b> Defect in ${getSeg(m.segId).name} costs $${hit}M and hits brand.`);
+        }
+      }
+    });
+  });
+
+  // 6b. responsive brand. Each company's brand chases a target set by how good its
+  //     lineup is RELATIVE TO THE FIELD: lead on product (quality, freshness, halo)
+  //     and hold share, and brand climbs fast; coast and let models age, and it
+  //     stagnates and slips. This is the main way skill separates from the pack.
+  const strength = {};
+  st.companies.forEach(co => { strength[co.id] = productStrength(co); });
+  const fieldStr = st.companies.reduce((a,co)=>a+strength[co.id],0) / st.companies.length;
+  st.companies.forEach(co => {
+    const lead = strength[co.id] - fieldStr;                 // + = ahead of the field
+    const target = clamp(0.20 + 0.55*strength[co.id] + 0.80*lead
+                         + ((co.lastShareOverall||0.25)-0.25)*0.40, 0, 0.98);
+    const rate = target > co.brand ? C.brandRiseRate : C.brandFallRate;
+    co.brand = clamp(lerp(co.brand, target, rate), 0, 1);
+    if (co.persona==='premium')     co.brand = clamp(co.brand+0.002,  0, 1);
+    if (co.persona==='performance') co.brand = clamp(co.brand+0.0015, 0, 1);
+    // halo coupe: a V8/V12 coupe lifts brand further for whoever runs one
+    const haloCoupe = co.models.find(m => m.active && m.segId==='coupe' && (m.engId==='V8'||m.engId==='V12'));
+    if (haloCoupe) {
+      const haloBoost = C.haloBump * coPerf(co, haloCoupe.engId);
+      co.brand = clamp(co.brand + haloBoost, 0, 1);
+      if (co.player) st.lastHaloBonus = +(haloBoost * 100).toFixed(3);
+    } else if (co.player) {
+      st.lastHaloBonus = 0;
+    }
+  });
+  events.push(...recallEvents);
+
+  // 6.5 shareholder dividend sweep — excess capital above the reserve goes back
+  //     to owners, so cash can't be hoarded and profits don't balloon.
+  st.lastDividend = 0;
+  if (player.cash > C.cashReserveSoft) {
+    const sweep = (player.cash - C.cashReserveSoft) * C.dividendRate;
+    player.cash -= sweep;
+    st.lastDividend = Math.round(sweep);
+  }
+
+  // 7. clock advance
+  st.tick++; st.quarter++; if (st.quarter>4){st.quarter=1;st.year++;}
+  recordHistory(st);
+  pushLog(st, events);
+  // win / lose / timeout — order matters
+  const obj = st.objective;
+  if (player.cash < 0) {
+    st.over = true; st.overReason = 'bankrupt';
+  } else if (!st.won && objectiveMet(st)) {
+    st.over = true; st.won = true; st.overReason = 'win';
+  } else if (st.year > obj.deadlineYear ||
+             (st.year === obj.deadlineYear && st.quarter > obj.deadlineQuarter)) {
+    st.over = true; st.overReason = 'timeout';
+  }
+  if (st.over) {
+    st.score = Math.round(st.peakShare*1000 + player.cash/5 + player.brand*100 + (st.won ? 500 : 0));
+  }
+  return st;
+}
+
+// ── history + log ─────────────────────────────────────────────────────────────
+function recordHistory(st) {
+  const totals = {}; let grand = 0;
+  st.companies.forEach(c => totals[c.id] = 0);
+  SEGS.forEach(s => {
+    const sh = segShares(s.id, st);
+    st.companies.forEach(c => {
+      const e = sh[c.id]; if (!e) return;
+      totals[c.id] += e.units; grand += e.units;
+    });
+  });
+  if (!grand) grand = 1;
+  const pt = {};
+  st.companies.forEach(c => {
+    pt[c.id] = totals[c.id]/grand;
+    c.lastShareOverall = pt[c.id]||0;
+  });
+  st.history.push(pt);
+  if (st.history.length > 32) st.history.shift();
+  st.lastOverall = pt['you']||0;
+  if (st.peakShare !== undefined) st.peakShare = Math.max(st.peakShare, st.lastOverall);
+}
+
+// A "what changed" + "what to consider next" briefing tied to REAL events this
+// quarter (recalls, capacity caps, rival cuts, halo, novelty, share swings),
+// not generic filler. Returns { changed, next }.
+function computeInsights(st, events) {
+  const player = st.companies.find(c=>c.player);
+  const active = player.models.filter(m=>m.active);
+  const segName = id => getSeg(id).name;
+
+  const curOverall  = st.lastOverall;
+  const prevOverall = st.history.length>=2 ? (st.history[st.history.length-2]['you']||curOverall) : curOverall;
+  const dShare = (curOverall - prevOverall)*100;
+
+  const freshRecall = active.find(m => m.recallQ === C.recallDuration);
+  const capped      = st.lastCapFill < 0.97;
+  const rivalCut    = events.some(e => e.indexOf('cuts prices') >= 0);
+  const stale       = active.find(m => m.novelty < 0.36);
+  const missing     = SEGS.filter(s => !active.find(m => m.segId===s.id));
+  const maxRival    = Math.max(...st.companies.filter(c=>!c.player).map(c=>c.brand));
+  const brandLeader = st.companies.filter(c=>!c.player).sort((a,b)=>b.brand-a.brand)[0];
+  const thin        = active.find(m => (m.price - m.cost) < 1.6);
+  const target      = Math.round((st.objective.targetShare||0.33)*100);
+  const inSeg       = id => active.some(m => m.segId===id);
+
+  // most player-relevant world event this year (from Task-2 event tags)
+  const dm = st.demandMult || {};
+  let eventLine = null;
+  for (const tg of (st.lastEventTags || [])) {
+    if (tg.kind==='boom') {
+      eventLine = inSeg(tg.seg)
+        ? `<b>${segName(tg.seg)} demand is booming</b> this year — your ${segName(tg.seg)} is placed to ride it.`
+        : `<b>${segName(tg.seg)} demand is booming</b> this year — and you don't sell one.`;
+      break;
+    }
+    if (tg.kind==='pricewar' && inSeg(tg.seg)) {
+      eventLine = `<b>${tg.who}'s price war</b> in ${segName(tg.seg)} is squeezing your margins there.`; break;
+    }
+    if (tg.kind==='halo') { eventLine = `<b>${tg.who} launched a halo coupe</b> — your brand edge just narrowed.`; break; }
+    if (tg.kind==='shock') { eventLine = `A <b>supply shock</b> lifted unit costs across the board this quarter.`; break; }
+  }
+  // the market's fastest-growing segment (for forward-looking advice)
+  const grow = SEGS.slice().sort((a,b)=>(dm[b.id]||1)-(dm[a.id]||1))[0];
+  const growMult = dm[grow.id] || 1;
+
+  // ── what changed ──
+  let changed;
+  if (freshRecall) {
+    changed = `A <b>recall</b> in your ${segName(freshRecall.segId)} dented brand and cost cash.`;
+  } else if (capped) {
+    changed = `Demand outran the plant — you built only <b>${Math.round(st.lastCapFill*100)}%</b> of your orders.`;
+  } else if (eventLine) {
+    changed = eventLine;
+  } else if (rivalCut) {
+    changed = `A rival <b>cut prices</b> to claw back share this quarter.`;
+  } else if (Math.abs(dShare) >= 0.6) {
+    changed = `Your overall share ${dShare>0?'rose to':'slipped to'} <b>${(curOverall*100).toFixed(1)}%</b>.`;
+  } else if (st.lastHaloBonus > 0) {
+    changed = `Your coupe <b>halo</b> lifted brand again — now ${Math.round(player.brand*100)}.`;
+  } else if (stale) {
+    changed = `Your ${segName(stale.segId)} is starting to feel <b>dated</b>.`;
+  } else {
+    changed = `A steady quarter — overall share held near <b>${(curOverall*100).toFixed(1)}%</b>.`;
+  }
+
+  // ── what to consider next ──
+  let next;
+  if (st.lastCapFill < 0.95) {
+    next = `Expand capacity — you're leaving sales on the table.`;
+  } else if (stale) {
+    next = `Refresh your <b>${segName(stale.segId)}</b> before novelty drags it down.`;
+  } else if (missing.length && player.cash >= C.designBase + C.segmentLaunchCost + 40) {
+    next = `You're absent from <b>${missing[0].name}</b> — entering it would widen your reach.`;
+  } else if (growMult > 1.15 && !inSeg(grow.id)) {
+    next = `<b>${grow.name}</b> is the market's fastest-growing segment and you don't sell one.`;
+  } else if (growMult > 1.15 && (segShares(grow.id, st)['you']||{share:1}).share < curOverall) {
+    next = `Lean into <b>${grow.name}</b> — it's growing fast and you under-index there.`;
+  } else if (maxRival - player.brand > 0.08) {
+    next = `Brand trails <b>${brandLeader.name}</b> — quality R&D or a V8/V12 coupe would close it.`;
+  } else if (thin) {
+    next = `Margins are thin in <b>${segName(thin.segId)}</b> — mfg R&D or a small price rise helps.`;
+  } else if (curOverall >= (st.objective.targetShare||1)*0.9) {
+    next = `You're closing on the <b>${target}%</b> goal — keep the lineup fresh and hold share.`;
+  } else {
+    next = `Solid footing — keep investing in product and brand to pull ahead.`;
+  }
+  return { changed, next };
+}
+
+function pushLog(st, events) {
+  const player = st.companies.find(c=>c.player);
+  const ins = computeInsights(st, events);
+  const ev = [];
+
+  // lead with the briefing
+  ev.push(`<b>›</b> ${ins.changed}`);
+  ev.push(`<b>→</b> ${ins.next}`);
+
+  // one rival headline for colour
+  ev.push(...events);
+  const rivals = st.companies.filter(c=>!c.player);
+  const mover = rivals[st.tick % rivals.length];
+  const s = SEGS[st.tick % SEGS.length];
+  const rm = mover.models.find(m=>m.segId===s.id&&m.active);
+  if (rm) {
+    const pct = Math.round(rm.lastShare*100);
+    let headline;
+    if (pct >= 38) {
+      headline = `<b>${mover.name}</b> dominates ${s.name} — ${ENGINES[rm.engId].name} at $${rm.price.toFixed(1)}k, ${pct}% share.`;
+    } else if (pct <= 14) {
+      headline = `<b>${mover.name}</b> is bleeding share in ${s.name} (${pct}%) — slashed to $${rm.price.toFixed(1)}k.`;
+    } else if (mover.persona === 'premium' && rm.price > s.refPrice * 1.2) {
+      headline = `<b>${mover.name}</b> prices its ${s.name} ${ENGINES[rm.engId].name} at a premium: $${rm.price.toFixed(1)}k.`;
+    } else if (mover.persona === 'performance' && (rm.engId === 'V8' || rm.engId === 'V12')) {
+      headline = `<b>${mover.name}</b> bets on the ${ENGINES[rm.engId].name} in ${s.name} at $${rm.price.toFixed(1)}k.`;
+    } else {
+      headline = `<b>${mover.name}</b> holds ${s.name} at $${rm.price.toFixed(1)}k (${pct}% share).`;
+    }
+    ev.push(headline);
+  }
+
+  // result line, with the dividend sweep surfaced when it fires
+  const pl = st.lastProfit;
+  let result = `Q result: <b>${pl>=0?'+':''}$${Math.round(pl)}M</b> · cash $${Math.round(player.cash)}M`;
+  if (st.lastDividend > 0) result += ` (returned $${st.lastDividend}M to shareholders)`;
+  result += '.';
+  ev.push(result);
+
+  st.log.unshift({ label:`Q${st.quarter}'${String(st.year).slice(2)}`, html:ev.join(' ') });
+  if (st.log.length > 8) st.log.pop();
+}
+
+// ── objectives ────────────────────────────────────────────────────────────────
+// Selectable victory conditions. The objective stored on state is pure data
+// (so it serialises for save/load); all logic lives in these functions keyed
+// by objective id.
+const OBJECTIVES = {
+  share:       { id:'share',       name:'Market Leader',      blurb:'Reach 33% overall market share by 2000 — out-build the field.' },
+  volume:      { id:'volume',      name:'Volume King',        blurb:'Sell 7 million cars (cumulative) by 2000 — a high-volume value play.' },
+  performance: { id:'performance', name:'Performance Legend', blurb:'Brand 70+ and 25% of the Coupe segment by 2000 — a halo brand.' },
+  fullline:    { id:'fullline',    name:'Full-Line Automaker',blurb:'All four segments, brand 62+, 25% share, profitable, by 2000.' },
+  tech:        { id:'tech',        name:'Electric Pioneer',   blurb:'Field a Hybrid and an EV and hold 25% share — by 2005 (the long game).' },
+};
+
+function makeObjective(id) {
+  const base = { id, deadlineYear:2000, deadlineQuarter:4 };
+  if (id === 'share')  base.targetShare = 0.33;     // responsive curve → higher ceilings
+  if (id === 'volume') base.targetUnits = 7000;     // thousands of cars (7M) sold cumulatively
+  if (id === 'tech')   base.deadlineYear = 2005;    // longer horizon so Hybrid/EV matter
+  return base;
+}
+
+function coupeShareOf(st, coId) {
+  const sh = segShares('coupe', st)[coId];
+  return sh ? sh.share : 0;
+}
+function hasEngine(p, engId) { return p.models.some(m => m.active && m.engId === engId); }
+
+function objectiveMet(st) {
+  const p = st.companies.find(c=>c.player);
+  const o = st.objective;
+  switch (o.id) {
+    // Volume King: raw cumulative units — rewards a high-volume value/capacity play,
+    // not share. A premium low-volume maker can't reach it.
+    case 'volume':      return st.totalUnits >= (o.targetUnits || 7000);
+    case 'performance': return p.brand >= 0.70 && coupeShareOf(st, 'you') >= 0.25;
+    case 'fullline': {
+      // breadth + maturity: present in all four is necessary but not sufficient —
+      // a 62+ brand (reputation takes years to build) keeps this from being won by
+      // an early land-grab.
+      const segs = new Set(p.models.filter(m=>m.active).map(m=>m.segId));
+      return segs.size >= 4 && st.lastOverall >= 0.25 && st.lastProfit >= 0 && p.brand >= 0.62;
+    }
+    // Electric Pioneer: must actually adopt the late-era powertrains (Hybrid '97,
+    // EV '01) and still hold a quarter of the market — a long-horizon tech goal.
+    case 'tech':        return hasEngine(p,'hybrid') && hasEngine(p,'ev') && st.lastOverall >= 0.25;
+    case 'share':
+    default:            return st.lastOverall >= (o.targetShare || 0.33);
+  }
+}
+
+// Banner-friendly progress readout for the current objective.
+function objectiveStatus(st) {
+  const p = st.companies.find(c=>c.player);
+  const o = st.objective;
+  const now = st.lastOverall * 100;
+  const meta = OBJECTIVES[o.id] || OBJECTIVES.share;
+  const tick = v => v ? '✓' : '✗';
+  let detail;
+  switch (o.id) {
+    case 'volume':
+      detail = `Cars sold <b>${(st.totalUnits/1000).toFixed(2)}M</b> / ${((o.targetUnits||7000)/1000).toFixed(0)}M`;
+      break;
+    case 'performance':
+      detail = `Brand <b>${Math.round(p.brand*100)}</b>/70 · Coupe <b>${Math.round(coupeShareOf(st,'you')*100)}</b>%/25%`;
+      break;
+    case 'fullline': {
+      const segs = new Set(p.models.filter(m=>m.active).map(m=>m.segId)).size;
+      detail = `Segments <b>${segs}</b>/4 · Brand <b>${Math.round(p.brand*100)}</b>/62 · Share <b>${now.toFixed(1)}</b>%/25% · ${st.lastProfit>=0?'profitable':'<b>unprofitable</b>'}`;
+      break;
+    }
+    case 'tech':
+      detail = `Hybrid <b>${tick(hasEngine(p,'hybrid'))}</b> · EV <b>${tick(hasEngine(p,'ev'))}</b> · Share <b>${now.toFixed(1)}</b>%/25%`;
+      break;
+    default:
+      detail = `Share <b>${now.toFixed(1)}</b>% / ${Math.round((o.targetShare||0.33)*100)}%`;
+  }
+  return { name: meta.name, detail, met: objectiveMet(st) };
+}
+
+// End-of-run recap: the best-selling nameplate, the decisive factor, and a
+// one-line "story of your company". Pure data → text; rendered by the shell.
+function endRecap(st) {
+  const p = st.companies.find(c=>c.player);
+  const active = p.models.filter(m=>m.active);
+  const best = p.models.slice().sort((a,b)=>(b.totalUnits||0)-(a.totalUnits||0))[0];
+  const bestSeller = best && best.totalUnits > 0
+    ? { label:`${ENGINES[best.engId].name} ${getSeg(best.segId).name}`, units:Math.round(best.totalUnits) }
+    : null;
+
+  const share = st.lastOverall * 100;
+  const fieldBrandMax = Math.max(...st.companies.filter(c=>!c.player).map(c=>c.brand));
+  const brandLeads = p.brand >= fieldBrandMax;
+  const halo = active.find(m => m.segId==='coupe' && (m.engId==='V8'||m.engId==='V12'));
+  let bestSeg = null;
+  SEGS.forEach(s => { const sh = segShares(s.id, st)['you']; if (sh && (!bestSeg || sh.share>bestSeg.sh)) bestSeg = { name:s.name, sh:sh.share }; });
+
+  let decisive;
+  if (st.overReason === 'bankrupt') {
+    decisive = `costs outran the cars you could sell — the books went red`;
+  } else if (st.overReason === 'timeout') {
+    decisive = bestSeg ? `your ${bestSeg.name} carried you, but the field kept pace` : `the field kept pace`;
+  } else {
+    if (st.objective.id === 'volume')      decisive = `relentless volume — ${(st.totalUnits/1000).toFixed(1)}M cars out the door`;
+    else if (st.objective.id === 'tech')   decisive = `an early, decisive bet on hybrid and electric`;
+    else if (halo && brandLeads)           decisive = `a commanding halo brand built on your V8 coupe`;
+    else if (bestSeg && bestSeg.sh > 0.42) decisive = `dominance in ${bestSeg.name} (${Math.round(bestSeg.sh*100)}% of the segment)`;
+    else if (brandLeads)                   decisive = `the strongest brand in the market`;
+    else                                   decisive = `a broad, well-developed full line`;
+  }
+
+  const descriptor = share>=32 ? 'market leader' : share>=26 ? 'major automaker' : share>=16 ? 'mid-tier maker' : 'niche player';
+  let story;
+  if (st.overReason === 'bankrupt') {
+    story = `Founded in 1990, ${p.name} overreached and folded in ${st.year} — ${decisive}.`;
+  } else if (st.won) {
+    story = `Founded in 1990, ${p.name} grew into a ${share.toFixed(0)}% ${descriptor} by ${st.year}` +
+            (bestSeller ? `, carried by the ${bestSeller.label}` : '') + `.`;
+  } else {
+    story = `Founded in 1990, ${p.name} stalled as a ${share.toFixed(0)}% ${descriptor} by ${st.year} — ${decisive}.`;
+  }
+
+  return { bestSeller, decisive, story };
+}
+
+// ── new game ──────────────────────────────────────────────────────────────────
+function newGame(seed, objectiveId) {
+  seed = ((seed||0) || Math.floor(Math.random()*0xFFFFFF)) >>> 0;
+  const st = {
+    seed, rngState: seed,
+    year: C.startYear, quarter: 1, tick: 0,
+    companies: [
+      { id:'you',   name:'Your Co.',  hex:'#F2A33C', player:true,  persona:'player',
+        brand:0.44, cash:C.startCash, rd:{eng:0,eff:0,mfg:0}, factory:{capacity:C.capacityStart},
+        models:[], launchedSegs:{}, lastShareOverall:0 },
+      // Rivals are abstract incumbents — the economy never reads a rival
+      // factory, so they carry no capacity field (no unused/fake data).
+      { id:'velo',  name:'Velo',      hex:'#5B8DEF', player:false, persona:'value',
+        brand:0.38, cash:320, rd:{eng:70,eff:120,mfg:150},
+        models:[], lastShareOverall:0 },
+      { id:'crown', name:'Crownmark', hex:'#C45E78', player:false, persona:'premium',
+        brand:0.65, cash:350, rd:{eng:200,eff:50,mfg:180},
+        models:[], lastShareOverall:0 },
+      { id:'nuvo',  name:'Nuvo',      hex:'#3FB8AF', player:false, persona:'performance',
+        brand:0.54, cash:320, rd:{eng:320,eff:45,mfg:90},
+        models:[], lastShareOverall:0 },
+    ],
+    history:[], log:[], lastProfit:0, lastUnits:0, lastOverall:0.25,
+    lastCapFill:1, lastDemand:0, lastOverhead:0, lastDividend:0,
+    demandMult:{ sedan:1, suv:1, pickup:1, coupe:1 }, costShockMult:1, lastEvents:[], lastEventTags:[],
+    over:false, won:false, overReason:null, score:null,
+    totalUnits:0, peakShare:0, lastHaloBonus:0, launchFlow:true,
+    objective: makeObjective(objectiveId || 'share'),
+  };
+
+  // rivals seed all four segments
+  st.companies.filter(c=>!c.player).forEach(co => {
+    const per = PERSONAS[co.persona];
+    SEGS.forEach(s => {
+      const eng = per.prefEng[s.id];
+      if (!eng||!ENGINES[eng].fits.includes(s.id)||st.year<ENGINES[eng].unlock) return;
+      co.models.push(makeModel(s.id, eng, per.prefTrim, co.persona));
+    });
+    applyRD(co);
+  });
+
+  recordHistory(st);
+  st.peakShare = st.lastOverall;
+  st.log.push({ label:`Q1'${String(C.startYear).slice(2)}`, html:`<b>Founded.</b> Choose your launch model. Rivals are already competing in all four segments.` });
+  return st;
+}
+
+return { newGame, advance, segShares, playerDesign, playerRefresh, playerRetire,
+         quoteDesign, objectiveStatus, objectiveMet, makeObjective, OBJECTIVES, endRecap,
+         SEGS, ENGINES, TRIMS, C };
+})();
+
+</script>
+<script>
+/* marque-factory.js — animated isometric factory, MARQUE Phase 2
+ *
+ * Architecture: pure readout of sim state. Data flows sim → factory ONLY.
+ * This file never writes to sim state. Keep factory rendering logic separable.
+ *
+ * API:
+ *   MarqueFactory.init(canvasEl)        — attach canvas, start rAF loop
+ *   MarqueFactory.update(st, extras)    — call after advance(); reads new sim state
+ *                                         extras = { hasRecall: bool }
+ *   MarqueFactory.setViewSpeed(n)       — player speed toggle: 0.5 | 1 | 2
+ *   MarqueFactory.setNight(bool)        — player day/night toggle
+ *
+ * Sim state read (never written):
+ *   st.lastUnits     → conveyor speed + lot fill
+ *   player.models    → active bodystyle + engine badge on line cars
+ *   st.lastProfit    → scene health tint (mood overlay)
+ *   extras.hasRecall → triggers recall tow-back visual
+ */
+
+window.MarqueFactory = (() => {
+'use strict';
+
+// ── canvas ─────────────────────────────────────────────────────────────────
+let cv, ctx, W = 0, H = 0, DPR = 1;
+
+function resize(){
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W   = cv.clientWidth;
+  H   = cv.clientHeight;
+  cv.width  = W * DPR;
+  cv.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+
+// ── isometric projection ───────────────────────────────────────────────────
+const TW = 58, TH = 29, ZS = 21;
+let view = { ox:0, oy:0, sc:1 };
+
+function fit(){
+  // tuned for wide short hero band (e.g. 1200 × 280px)
+  view.sc = Math.min(W / 700, H / 340);
+  view.sc = Math.max(0.50, Math.min(view.sc, 1.4));
+  view.ox  = W * 0.35;
+  view.oy  = H * 0.23;
+}
+
+function iso(x, y, z){
+  const hw = TW/2, hh = TH/2;
+  return {
+    x: view.ox + (x - y) * hw * view.sc,
+    y: view.oy + (x + y) * hh * view.sc - (z||0) * ZS * view.sc,
+  };
+}
+const S = () => view.sc;
+
+// ── color utils ────────────────────────────────────────────────────────────
+const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+function shade(hex, amt){
+  const n = parseInt(hex.slice(1), 16);
+  const r = clamp(((n>>16)&255) + amt, 0, 255)|0;
+  const g = clamp(((n>>8 )&255) + amt, 0, 255)|0;
+  const b = clamp(((n    )&255) + amt, 0, 255)|0;
+  return `rgb(${r},${g},${b})`;
+}
+
+// ── primitives ─────────────────────────────────────────────────────────────
+function tile(x, y, fill, stroke){
+  const a=iso(x,y,0), b=iso(x+1,y,0), c=iso(x+1,y+1,0), d=iso(x,y+1,0);
+  ctx.beginPath();
+  ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.lineTo(c.x,c.y); ctx.lineTo(d.x,d.y);
+  ctx.closePath();
+  ctx.fillStyle = fill; ctx.fill();
+  if(stroke){ ctx.strokeStyle = stroke; ctx.lineWidth = 1; ctx.stroke(); }
+}
+
+function box(x, y, z, w, d, h, col, opt){
+  opt = opt || {};
+  const top = col, right = shade(col,-26), left = shade(col,-52);
+  const p = (X,Y,Z) => iso(X,Y,Z);
+  let A,B,C,D;
+  // right face (+x)
+  A=p(x+w,y,z); B=p(x+w,y+d,z); C=p(x+w,y+d,z+h); D=p(x+w,y,z+h);
+  ctx.fillStyle = opt.right || right; quad(A,B,C,D);
+  // left face (+y)
+  A=p(x,y+d,z); B=p(x+w,y+d,z); C=p(x+w,y+d,z+h); D=p(x,y+d,z+h);
+  ctx.fillStyle = opt.left || left; quad(A,B,C,D);
+  // top face
+  A=p(x,y,z+h); B=p(x+w,y,z+h); C=p(x+w,y+d,z+h); D=p(x,y+d,z+h);
+  ctx.fillStyle = opt.top || top; quad(A,B,C,D);
+  if(opt.outline){ ctx.strokeStyle = opt.outline; ctx.lineWidth = 1; ctx.stroke(); }
+}
+
+function quad(a, b, c, d){
+  ctx.beginPath();
+  ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.lineTo(c.x,c.y); ctx.lineTo(d.x,d.y);
+  ctx.closePath(); ctx.fill();
+}
+
+function isoLine(x1, y1, x2, y2, z, col, wd){
+  const a = iso(x1,y1,z), b = iso(x2,y2,z);
+  ctx.strokeStyle = col; ctx.lineWidth = wd||1;
+  ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+}
+
+// ── world constants ────────────────────────────────────────────────────────
+const LX = 2.6, LY0 = 0.7, LY1 = 6.4, PZ = 0.42, WELD_Y = 4.0;
+
+const SLOTS = [];
+for(let sy=1.2; sy<=5.2; sy+=1.3)
+  for(let sx=8.4; sx<=11.6; sx+=1.4)
+    SLOTS.push({ x:sx, y:sy, car:null });
+
+// per-bodystyle color palette (matches segment identity)
+const BS_COLORS = {
+  sedan:'#E8584B', suv:'#3F8EE0', pickup:'#46B97A', coupe:'#8E6BD8',
+};
+
+// per-bodystyle shape params: lm=length mult, wm=width mult, bH=body height,
+// cabRat=cabin fraction of length, cabH=cabin height, ride=z offset,
+// bed=true for pickup open-bed drawing
+const BS_SHAPES = {
+  sedan:  { lm:1.00, wm:1.00, bH:0.18, cabRat:0.50, cabH:0.16, ride:0.00 },
+  suv:    { lm:1.06, wm:1.08, bH:0.22, cabRat:0.62, cabH:0.19, ride:0.05 },
+  pickup: { lm:1.12, wm:1.04, bH:0.14, cabRat:0.38, cabH:0.15, ride:0.06, bed:true },
+  coupe:  { lm:0.97, wm:1.00, bH:0.14, cabRat:0.54, cabH:0.11, ride:0.00 },
+};
+
+// ── sim signal snapshot ────────────────────────────────────────────────────
+// Updated by .update() after each advance(). Never written by factory code.
+let simSignals = {
+  lineSpeed:  1.0,    // conveyor speed multiplier from st.lastUnits
+  lotTarget:  3,      // target number of parked cars from last quarter's sales
+  bodystyle:  'sedan',
+  modelColor: '#E8584B',
+  engId:      'I4',
+  healthTint: 0,      // -1 (struggling) … +1 (thriving)
+};
+let pendingRecall = false;  // true until next car graduation handles the visual
+
+// ── world state ────────────────────────────────────────────────────────────
+let fT = 0, viewSpeed = 1, night = false;
+let lineCars = [], roadCars = [], smoke = [], sparks = [], clouds = [];
+let spawnTimer = 0;
+
+const workers = [
+  { type:'idle',   x:LX-0.9,  y:2.2,    ph:Math.random()*6 },
+  { type:'idle',   x:LX+0.9,  y:3.2,    ph:Math.random()*6 },
+  { type:'idle',   x:LX-0.9,  y:5.0,    ph:Math.random()*6 },
+  { type:'idle',   x:LX+0.95, y:WELD_Y, ph:Math.random()*6 },
+  { type:'patrol', wp:[{x:0.8,y:1},{x:0.8,y:6},{x:4.4,y:6},{x:4.4,y:1}],
+    i:0, x:0.8, y:1, ph:0, sp:0.55 },
+  { type:'patrol', wp:[{x:4.6,y:6.8},{x:8,y:6.8},{x:8,y:5.5},{x:4.6,y:5.5}],
+    i:0, x:4.6, y:6.8, ph:0, sp:0.5 },
+];
+
+const forklift = {
+  wp:[{x:0.6,y:0.6},{x:LX-0.2,y:0.9},{x:LX-0.2,y:0.9},{x:0.6,y:0.6}],
+  i:0, x:0.6, y:0.6, carry:true, sp:0.7, vx:0, vy:0, ph:0,
+};
+
+for(let i=0; i<5; i++)
+  clouds.push({ x:Math.random(), y:0.05+Math.random()*0.12,
+                s:0.6+Math.random()*0.8, sp:0.004+Math.random()*0.006 });
+
+function primeLineCars(){
+  for(let k=0; k<5; k++)
+    lineCars.push({ y:LY0+k*1.1, color:simSignals.modelColor,
+                    bs:simSignals.bodystyle, vy:1 });
+}
+
+// ── helpers ────────────────────────────────────────────────────────────────
+function getEffSpeed(){ return Math.max(0.25, viewSpeed * simSignals.lineSpeed); }
+function freeSlot(){ return SLOTS.find(s => !s.car); }
+function stageForY(y){ if(y<2.0) return 1; if(y<3.4) return 2; if(y<5.0) return 3; return 4; }
+
+// ── update ─────────────────────────────────────────────────────────────────
+function updateWorld(dt){
+  const eff = getEffSpeed();
+  fT += dt;
+
+  // spawn new cars
+  spawnTimer -= dt * eff;
+  if(spawnTimer <= 0){
+    lineCars.push({ y:LY0, color:simSignals.modelColor,
+                    bs:simSignals.bodystyle, vy:1 });
+    spawnTimer = 2.6;
+  }
+
+  // move line cars
+  for(const c of lineCars) c.y += 0.85 * eff * dt;
+
+  // graduate finished cars
+  for(let i=lineCars.length-1; i>=0; i--){
+    if(lineCars[i].y < LY1) continue;
+    const c = lineCars.splice(i, 1)[0];
+
+    if(pendingRecall){
+      // recall visual: car drives out then U-turns back into plant
+      roadCars.push({
+        x:LX, y:6.6, color:'#E5605E', bs:c.bs,
+        path:[{x:LX,y:7.1},{x:LX,y:7.5},{x:5.0,y:7.5},{x:LX,y:7.5},{x:LX,y:LY1+0.1}],
+        pi:0, slot:null, parked:false, vx:0, vy:1, isRecall:true,
+      });
+      pendingRecall = false;
+    } else {
+      const slot = freeSlot();
+      const path = slot
+        ? [{x:LX,y:6.9},{x:LX,y:7.3},{x:8.0,y:7.3},{x:slot.x,y:7.3},{x:slot.x,y:slot.y}]
+        : [{x:LX,y:6.9},{x:LX,y:7.3},{x:13.5,y:7.3},{x:13.5,y:11}];
+      if(slot) slot.car = true;
+      roadCars.push({
+        x:LX, y:6.6, color:c.color, bs:c.bs,
+        path, pi:0, slot, parked:false, vx:0, vy:1,
+      });
+    }
+  }
+
+  // weld sparks at gantry
+  for(const c of lineCars){
+    if(Math.abs(c.y - WELD_Y) < 0.35 && Math.random() < 0.5 * eff){
+      const p = iso(LX+0.5, WELD_Y+0.5, PZ+0.55);
+      sparks.push({ x:p.x, y:p.y, vx:(Math.random()-0.5)*70, vy:-Math.random()*60-10, life:0.35 });
+    }
+  }
+
+  // road cars follow waypoint paths
+  const roadSp = 1.7 * eff;
+  for(let i=roadCars.length-1; i>=0; i--){
+    const c = roadCars[i];
+    if(c.parked) continue;
+    const tgt = c.path[c.pi];
+    const dx = tgt.x - c.x, dy = tgt.y - c.y, dist = Math.hypot(dx, dy);
+    if(dist < 0.06){
+      c.pi++;
+      if(c.pi >= c.path.length){
+        if(c.slot){ c.parked = true; c.vx = 0; c.vy = 0; }
+        else roadCars.splice(i, 1);
+        continue;
+      }
+    } else {
+      c.vx = dx/dist; c.vy = dy/dist;
+      c.x += c.vx * roadSp * dt;
+      c.y += c.vy * roadSp * dt;
+    }
+  }
+
+  // lot management: keep parked count near lotTarget from sim
+  const parked = roadCars.filter(c => c.parked && !c.isRecall);
+  if(parked.length >= Math.min(simSignals.lotTarget + 1, SLOTS.length)){
+    const ship = parked[0];
+    if(ship.slot){ ship.slot.car = null; ship.slot = null; }
+    ship.parked = false;
+    ship.path = [{x:ship.x,y:7.3},{x:13.8,y:7.3},{x:13.8,y:11}];
+    ship.pi = 0;
+  }
+
+  // workers
+  for(const w of workers){
+    if(w.type === 'patrol'){
+      const tgt = w.wp[w.i];
+      const dx = tgt.x-w.x, dy = tgt.y-w.y, d = Math.hypot(dx, dy);
+      if(d < 0.05) w.i = (w.i+1) % w.wp.length;
+      else { w.x += dx/d*w.sp*eff*dt; w.y += dy/d*w.sp*eff*dt; }
+      w.ph += dt * eff * 9;
+    } else {
+      w.ph += dt * eff * 5;
+    }
+  }
+
+  // forklift
+  {
+    const f = forklift, tgt = f.wp[f.i];
+    const dx = tgt.x-f.x, dy = tgt.y-f.y, d = Math.hypot(dx, dy);
+    if(d < 0.06){ f.i = (f.i+1) % f.wp.length; f.carry = f.i < 2; }
+    else { f.vx = dx/d; f.vy = dy/d; f.x += dx/d*f.sp*eff*dt; f.y += dy/d*f.sp*eff*dt; }
+    f.ph += dt;
+  }
+
+  // smoke from stack
+  if(Math.random() < 0.6){
+    const p = iso(1.0, 0.6, 2.5);
+    smoke.push({ x:p.x, y:p.y, r:5, vy:-12-Math.random()*8, vx:8+Math.random()*6, life:1 });
+  }
+  for(let i=smoke.length-1; i>=0; i--){
+    const s = smoke[i];
+    s.x += s.vx*dt; s.y += s.vy*dt; s.r += 9*dt; s.life -= 0.32*dt;
+    if(s.life <= 0) smoke.splice(i, 1);
+  }
+  for(let i=sparks.length-1; i>=0; i--){
+    const s = sparks[i];
+    s.x += s.vx*dt; s.y += s.vy*dt; s.vy += 200*dt; s.life -= dt;
+    if(s.life <= 0) sparks.splice(i, 1);
+  }
+  for(const cl of clouds){ cl.x += cl.sp*dt*0.06; if(cl.x > 1.2) cl.x = -0.3; }
+}
+
+// ── draw car (with bodystyle variants) ─────────────────────────────────────
+function drawCar(wx, wy, wz, color, vx, vy, stage, bs){
+  bs = bs || 'sedan';
+  const sh = BS_SHAPES[bs] || BS_SHAPES.sedan;
+  const alongX = Math.abs(vx) >= Math.abs(vy);
+  const len = 0.82 * sh.lm, wid = 0.46 * sh.wm;
+  const w = alongX ? len : wid, d = alongX ? wid : len;
+  const x = wx - w/2, y = wy - d/2;
+  const bz = wz + sh.ride;
+
+  // wheels (stage 4)
+  if(stage >= 4){
+    const ws = 0.12;
+    [[x+0.07,y+0.04],[x+w-0.19,y+0.04],[x+0.07,y+d-0.16],[x+w-0.19,y+d-0.16]].forEach(p=>{
+      box(p[0],p[1],bz,ws,ws,0.10,'#23262C');
+    });
+  }
+
+  if(stage === 1){ box(x,y,bz+0.06,w,d,0.10,'#41454D'); return; }
+
+  // body
+  const bodyZ = stage >= 4 ? bz+0.12 : bz+0.06;
+  box(x,y,bodyZ,w,d,sh.bH,color,{outline:'rgba(0,0,0,.12)'});
+
+  // cabin (stage 3+)
+  if(stage >= 3){
+    if(sh.bed){
+      // pickup: cabin over rear 40% only; bed (open body top) at front
+      const cabLen = alongX ? w*0.40 : d*0.40;
+      const cabWid = alongX ? d*0.85 : w*0.85;
+      const cx = alongX ? (vx>=0 ? x : x+w-cabLen) : x+(w-cabWid)/2;
+      const cy = alongX ? y+(d-cabWid)/2 : (vy>=0 ? y : y+d-cabLen);
+      const cw = alongX ? cabLen : cabWid;
+      const cd = alongX ? cabWid : cabLen;
+      box(cx,cy,bodyZ+sh.bH,cw,cd,sh.cabH,shade(color,18));
+      const gz = bodyZ+sh.bH+sh.cabH;
+      const a=iso(cx,cy,gz), b=iso(cx+cw,cy,gz), c2=iso(cx+cw,cy+cd,gz), d2=iso(cx,cy+cd,gz);
+      ctx.fillStyle = night ? '#1b2740' : '#9fc4e0'; quad(a,b,c2,d2);
+    } else {
+      // sedan / suv / coupe: full-width cabin
+      const cw = alongX ? w*sh.cabRat : w*0.74;
+      const cd = alongX ? d*0.74 : d*sh.cabRat;
+      const cx = alongX ? x+(vx>=0 ? w*0.18 : w*(1-sh.cabRat-0.18)) : x+(w-cw)/2;
+      const cy = alongX ? y+(d-cd)/2 : y+(vy>=0 ? d*0.18 : d*(1-sh.cabRat-0.18));
+      box(cx,cy,bodyZ+sh.bH,cw,cd,sh.cabH,shade(color,18));
+      const gz = bodyZ+sh.bH+sh.cabH;
+      const a=iso(cx,cy,gz), b=iso(cx+cw,cy,gz), c2=iso(cx+cw,cy+cd,gz), d2=iso(cx,cy+cd,gz);
+      ctx.fillStyle = night ? '#1b2740' : '#9fc4e0'; quad(a,b,c2,d2);
+    }
+  }
+
+  // headlights at night
+  if(stage >= 4 && night){
+    const fx = alongX ? (vx>=0 ? x+w : x) : x+w/2;
+    const fy = alongX ? y+d/2 : (vy>=0 ? y+d : y);
+    const fp = iso(fx, fy, bodyZ+0.05);
+    ctx.fillStyle = 'rgba(255,245,200,.95)';
+    ctx.beginPath(); ctx.arc(fp.x,fp.y,2.4,0,7); ctx.fill();
+  }
+}
+
+// ── sky ──────────────────────────────────────────────────────────────────────
+function drawSky(){
+  const g = ctx.createLinearGradient(0,0,0,H);
+  if(night){
+    g.addColorStop(0,'#161E30'); g.addColorStop(.7,'#243049'); g.addColorStop(1,'#2C3A55');
+  } else {
+    g.addColorStop(0,'#9FD6EE'); g.addColorStop(.55,'#CFEAF4'); g.addColorStop(1,'#E8F4E0');
+  }
+  ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  if(night){
+    ctx.fillStyle = 'rgba(255,255,255,.8)';
+    for(let i=0; i<40; i++){
+      const sx=(i*97.3)%W, sy=(i*53.7)%(H*0.5);
+      ctx.globalAlpha = 0.3+0.5*((i*13)%7)/7;
+      ctx.fillRect(sx,sy,1.6,1.6);
+    }
+    ctx.globalAlpha = 1;
+  }
+  for(const cl of clouds){
+    const cx=cl.x*W, cy=cl.y*H, s=cl.s*40;
+    ctx.fillStyle = night ? 'rgba(190,200,220,.10)' : 'rgba(255,255,255,.7)';
+    const blob = (bx,by,r) => { ctx.beginPath(); ctx.ellipse(bx,by,r,r*0.62,0,0,7); ctx.fill(); };
+    blob(cx,cy,s); blob(cx+s*0.9,cy+s*0.12,s*0.8); blob(cx-s*0.8,cy+s*0.15,s*0.7);
+  }
+}
+
+// ── ground ────────────────────────────────────────────────────────────────────
+function drawGround(){
+  for(let x=-1; x<13; x++) for(let y=-1; y<11; y++){
+    let col = '#8FC96B';
+    if(x>=0&&x<=4&&y>=0&&y<=6.5)         col = '#C6CAD0';
+    if(x>=7.6&&x<=12.4&&y>=0.4&&y<=6)    col = '#BFC3C9';
+    if(Math.abs(y-7)<1.0&&x>=0&&x<=13)   col = '#646973';
+    if(night) col = shade(col, -46);
+    tile(x,y,col,night?'rgba(0,0,0,.10)':'rgba(0,0,0,.05)');
+  }
+  for(let x=0.2; x<13; x+=0.9)
+    isoLine(x,7,x+0.45,7,0.01,night?'#9a8a3a':'#E8C84A',3*S());
+  for(const s of SLOTS){
+    const a=iso(s.x-0.45,s.y-0.55,0.01), b=iso(s.x+0.45,s.y-0.55,0.01),
+          c=iso(s.x+0.45,s.y+0.55,0.01), d=iso(s.x-0.45,s.y+0.55,0.01);
+    ctx.strokeStyle = night?'rgba(255,255,255,.18)':'rgba(255,255,255,.6)';
+    ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y);
+    ctx.lineTo(c.x,c.y); ctx.lineTo(d.x,d.y); ctx.closePath(); ctx.stroke();
+  }
+}
+
+// ── conveyor ──────────────────────────────────────────────────────────────────
+function drawConveyor(){
+  box(LX-0.55,LY0-0.4,0,1.1,(LY1-LY0)+0.8,PZ,'#9AA0A8');
+  const bx = LX-0.4, bw = 0.8;
+  box(bx,LY0-0.3,PZ,bw,(LY1-LY0)+0.6,0.02,'#3A3E45');
+  const off = (fT * 0.85 * getEffSpeed()) % 0.5;
+  for(let yy=LY0-0.3+off; yy<LY1+0.3; yy+=0.5)
+    isoLine(bx,yy,bx+bw,yy,PZ+0.03,'#5a5f68',2*S());
+  [2.0,5.2].forEach(yy=>{
+    box(LX-0.55,yy,PZ,0.06,0.5,0.06,'#F2B544');
+    box(LX+0.49,yy,PZ,0.06,0.5,0.06,'#F2B544');
+  });
+}
+
+// ── gantry ────────────────────────────────────────────────────────────────────
+function drawGantry(){
+  const gz = PZ+0.95;
+  box(LX-0.62,WELD_Y-0.1,0,0.12,0.12,gz,'#B8BEC6');
+  box(LX+0.52,WELD_Y-0.1,0,0.12,0.12,gz,'#B8BEC6');
+  box(LX-0.62,WELD_Y+0.45,0,0.12,0.12,gz,'#B8BEC6');
+  box(LX+0.52,WELD_Y+0.45,0,0.12,0.12,gz,'#B8BEC6');
+  box(LX-0.62,WELD_Y-0.1,gz,1.26,0.12,0.16,'#F2B544');
+  box(LX-0.62,WELD_Y+0.45,gz,1.26,0.12,0.16,'#F2B544');
+  const carHere = lineCars.some(c => Math.abs(c.y - WELD_Y) < 0.4);
+  const bob = carHere ? (Math.sin(fT*14)*0.06 - 0.18) : 0.05;
+  box(LX-0.12,WELD_Y+0.12,gz-0.45+bob,0.24,0.24,0.3,'#586070');
+  if(carHere){
+    const p = iso(LX, WELD_Y+0.24, gz-0.5+bob);
+    ctx.fillStyle = `rgba(180,220,255,${0.4+0.4*Math.random()})`;
+    ctx.beginPath(); ctx.arc(p.x,p.y,4+Math.random()*3,0,7); ctx.fill();
+  }
+}
+
+// ── worker ─────────────────────────────────────────────────────────────────
+function drawWorker(w){
+  const bob = Math.abs(Math.sin(w.ph)) * 0.05;
+  box(w.x-0.07,w.y-0.05,0,0.14,0.1,0.16+(w.type!=='idle'?Math.sin(w.ph)*0.02:0),'#2E3A59');
+  box(w.x-0.08,w.y-0.06,0.16+bob,0.16,0.12,0.2,'#F2B544');
+  const hp = iso(w.x,w.y,0.38+bob);
+  ctx.fillStyle='#E8B58A'; ctx.beginPath(); ctx.arc(hp.x,hp.y,3.6*S(),0,7); ctx.fill();
+  ctx.fillStyle='#E8584B'; ctx.beginPath(); ctx.arc(hp.x,hp.y-1.5*S(),4*S(),Math.PI,0); ctx.fill();
+}
+
+// ── forklift ──────────────────────────────────────────────────────────────────
+function drawForklift(f){
+  const facingX = Math.abs(f.vx||0) >= Math.abs(f.vy||1);
+  const fw = facingX?0.5:0.32, fd = facingX?0.32:0.5;
+  box(f.x-fw/2,f.y-fd/2,0,fw,fd,0.22,'#F2A33C');
+  box(f.x-fw/2+0.03,f.y-fd/2+0.03,0.22,fw-0.06,fd-0.06,0.16,'#D98A2B');
+  if(f.carry) box(f.x-0.12,f.y-0.12,0.4,0.24,0.24,0.18,'#B07A45');
+}
+
+// ── static structures ─────────────────────────────────────────────────────────
+function drawStaticStructures(list){
+  list.push({z:0.6, f:()=>{
+    box(0.78,0.4,0,0.44,0.44,2.4,'#C7553E');
+    box(0.78,0.4,1.9,0.44,0.44,0.18,'#EDEFF3');
+    box(0.74,0.36,2.4,0.52,0.52,0.12,'#8E3E2E');
+  }});
+  list.push({z:0.2, f:()=>{
+    box(-0.15,-0.15,0,0.16,6.6,1.3,night?'#3a4254':'#D8DDE3');
+    for(let yy=0.2; yy<6.4; yy+=1.2) box(-0.15,yy,1.3,4.4,0.08,0.06,'#9098A4');
+  }});
+  list.push({z:0.5, f:()=>{
+    box(0.3,1.3,0,0.4,0.4,0.4,'#B07A45'); box(0.3,1.3,0.4,0.4,0.4,0.4,'#A56E3C');
+    box(0.78,1.35,0,0.4,0.4,0.4,'#B07A45');
+  }});
+  list.push({z:6.4, f:()=>{
+    box(12.4,6.2,0,0.1,0.1,1.6,'#5A6270');
+    box(12.0,6.0,1.6,0.9,0.5,0.5,night?'#C99A2E':'#F2B544');
+    const p = iso(12.45,6.25,2.1);
+    ctx.fillStyle = '#10141C'; ctx.font = `700 ${9*S()}px Archivo,sans-serif`;
+    ctx.textAlign = 'center'; ctx.fillText('MARQUE',p.x,p.y);
+  }});
+  [[7.8,0.4],[12.2,0.4],[7.8,6.4]].forEach(L=>{
+    list.push({z:L[1]+0.5, f:()=>{
+      box(L[0],L[1],0,0.08,0.08,1.4,'#4A515C');
+      box(L[0]-0.05,L[1]-0.05,1.4,0.2,0.2,0.1,night?'#FFF4C2':'#C9CDD2');
+      if(night){
+        const p = iso(L[0]+0.05,L[1]+0.05,1.45);
+        const g = ctx.createRadialGradient(p.x,p.y,0,p.x,p.y,46);
+        g.addColorStop(0,'rgba(255,235,160,.5)'); g.addColorStop(1,'rgba(255,235,160,0)');
+        ctx.fillStyle = g; ctx.beginPath(); ctx.arc(p.x,p.y,46,0,7); ctx.fill();
+      }
+    }});
+  });
+}
+
+// ── main frame ─────────────────────────────────────────────────────────────────
+function frame(){
+  ctx.clearRect(0,0,W,H);
+  drawSky();
+  drawGround();
+  drawConveyor();
+
+  const list = [];
+  drawStaticStructures(list);
+
+  for(const c of lineCars)
+    list.push({z:c.y, f:()=>drawCar(LX,c.y,PZ,c.color,0,1,stageForY(c.y),c.bs)});
+
+  for(const c of roadCars){
+    list.push({z:c.y+c.x*0.001, f:()=>{
+      drawCar(c.x,c.y,0,c.color,c.vx,c.vy,4,c.bs);
+      // recall badge: red car driving the wrong way
+      if(c.isRecall && !c.parked){
+        const p = iso(c.x, c.y, 0.8);
+        ctx.font = `700 ${10*S()}px sans-serif`;
+        ctx.fillStyle = '#E5605E'; ctx.textAlign = 'center';
+        ctx.fillText('⚠', p.x, p.y);
+      }
+    }});
+  }
+
+  for(const w of workers) list.push({z:w.y+0.02, f:()=>drawWorker(w)});
+  list.push({z:forklift.y, f:()=>drawForklift(forklift)});
+  list.push({z:WELD_Y+0.6, f:drawGantry});
+
+  list.sort((a,b) => a.z - b.z);
+  for(const it of list) it.f();
+
+  // engine badge near gantry — shows what type is on the line
+  const weldCar = lineCars.find(c => stageForY(c.y) >= 3);
+  if(weldCar && simSignals.engId){
+    const p = iso(LX+0.1, WELD_Y-0.7, PZ+0.72);
+    ctx.font = `600 ${8*S()}px IBM Plex Mono,monospace`;
+    ctx.fillStyle = 'rgba(242,163,60,.88)'; ctx.textAlign = 'center';
+    ctx.fillText(simSignals.engId, p.x, p.y);
+  }
+
+  // sparks (screen space, on top of weld)
+  for(const s of sparks){
+    ctx.fillStyle = `rgba(255,${200+Math.random()*55|0},120,${clamp(s.life*2.5,0,1)})`;
+    ctx.fillRect(s.x,s.y,2,2);
+  }
+  // smoke
+  for(const s of smoke){
+    ctx.fillStyle = `rgba(${night?'150,160,180':'235,238,242'},${clamp(s.life*0.5,0,0.5)})`;
+    ctx.beginPath(); ctx.arc(s.x,s.y,s.r,0,7); ctx.fill();
+  }
+
+  // health tint: subtle dark overlay when company is struggling
+  if(simSignals.healthTint < -0.1){
+    const alpha = Math.min(0.22, (-simSignals.healthTint - 0.1) * 0.28);
+    ctx.fillStyle = `rgba(20,10,10,${alpha.toFixed(3)})`;
+    ctx.fillRect(0,0,W,H);
+  }
+
+  // night ambience overlay
+  if(night){ ctx.fillStyle='rgba(20,28,50,.22)'; ctx.fillRect(0,0,W,H); }
+}
+
+// ── RAF loop ───────────────────────────────────────────────────────────────────
+let last = 0;
+function loop(now){
+  if(!cv) return;
+  let dt = (now - last) / 1000; last = now; dt = Math.min(dt, 0.05);
+  updateWorld(dt);
+  frame();
+  requestAnimationFrame(loop);
+}
+
+// ── public API ─────────────────────────────────────────────────────────────────
+
+function init(canvasEl){
+  cv  = canvasEl;
+  ctx = cv.getContext('2d');
+  resize(); fit();
+  window.addEventListener('resize', () => { resize(); fit(); });
+  // reset sim state so re-init (e.g. headless tests) starts clean
+  lineCars.length = 0;
+  roadCars.length = 0;
+  smoke.length = 0;
+  sparks.length = 0;
+  spawnTimer = 0;
+  fT = 0;
+  pendingRecall = false;
+  primeLineCars();
+  last = performance.now();
+  requestAnimationFrame(loop);
+}
+
+// Map a production volume (k units/q) onto the line speed + lot fill.
+let companyUnits = 0;          // last whole-company output
+let focusUnits  = null;        // a specific plant's output when one is selected
+function applyUnits(u){
+  simSignals.lineSpeed = Math.max(0.35, Math.min(2.0, u / 90));
+  simSignals.lotTarget = u > 0 ? Math.min(SLOTS.length, Math.round(u / 8)) : 3;
+}
+
+// Focus the interior on a single plant's last-quarter output (or null = the whole
+// company). Read-only — never touches sim state.
+function setFocus(units){
+  focusUnits = (units == null) ? null : units;
+  applyUnits(focusUnits != null ? focusUnits : companyUnits);
+}
+
+function update(simState, extras){
+  extras = extras || {};
+  const player = simState.companies.find(c => c.player);
+
+  // find player's most recently active model
+  const active = player.models.filter(m => m.active);
+  const model  = active[active.length - 1] || null;
+
+  // line speed + lot fill from production volume (respecting any plant focus)
+  companyUnits = simState.lastUnits || 0;
+  applyUnits(focusUnits != null ? focusUnits : companyUnits);
+
+  if(model){
+    simSignals.bodystyle  = model.segId;
+    simSignals.modelColor = BS_COLORS[model.segId] || '#E8584B';
+    simSignals.engId      = model.engId;
+  }
+
+  // recall visual: fire on next car graduation
+  if(extras.hasRecall) pendingRecall = true;
+
+  // health tint: $200M is "normal" profit; negative = struggling
+  simSignals.healthTint = Math.max(-1, Math.min(1, (simState.lastProfit || 0) / 200));
+
+  // update cars currently on the line so they reflect new model immediately
+  for(const c of lineCars){
+    c.bs    = simSignals.bodystyle;
+    c.color = simSignals.modelColor;
+  }
+}
+
+function setViewSpeed(n){ viewSpeed = n; }
+function setNight(b){ night = !!b; }
+
+// Advance simulation by dt seconds without drawing. Decoupled from rAF so
+// headless tests can fast-forward state deterministically.
+function step(dt){ updateWorld(Math.min(dt, 0.05)); }
+
+// Read current factory state for assertions. Never writes to sim.
+function getState(){
+  return {
+    pendingRecall,
+    lineCars: lineCars.map(c => ({ bs: c.bs, color: c.color, y: +c.y.toFixed(3) })),
+    roadCars: roadCars.map(c => ({ parked: c.parked, isRecall: !!c.isRecall })),
+    parked: roadCars.filter(c => c.parked && !c.isRecall).length,
+    simSignals: Object.assign({}, simSignals),
+  };
+}
+
+return { init, update, step, getState, setViewSpeed, setNight, setFocus };
+
+})();
+
+</script>
+<script>
+/* marque-world.js — MARQUE campus builder (PART B, v2 architecture slice)
+ *
+ * The WORLD owns campus state: an isometric grid of placed buildings, selection,
+ * placement, and rendering. It never runs the economy and never mutates sim
+ * internals. The only thing it hands the economy is a derived input bundle via
+ * deriveCampusInputs(); the shell applies that to the sim at quarter advance.
+ *
+ * Money: the world never touches sim state. To pay for a build it asks the shell
+ * through the onSpend() callback (which deducts player cash and returns success).
+ *
+ * Headless-safe: all campus logic is pure functions over a plain campus object,
+ * and step(dt) is decoupled from requestAnimationFrame, so the campus can be
+ * tested and stepped without a DOM (rAF is frozen in hidden tabs).
+ *
+ * Tonight's catalog: the Assembly Plant only. Its level sets production capacity,
+ * which is the one campus input the sim actually consumes this build.
+ */
+
+window.MarqueWorld = (() => {
+'use strict';
+
+// ── grid + catalog ───────────────────────────────────────────────────────────
+const GRID_W = 9, GRID_D = 7;       // tiles
+const BASE_CAPACITY = 60;           // k units/q with no plants (a starter line)
+
+const CATALOG = {
+  assembly: {
+    type:'assembly', name:'Assembly Plant', w:4, d:3, maxLevel:2, color:'#6E7681',
+    levels: [
+      null,                                 // index 0 unused (levels are 1-based)
+      { capacity:120, placeCost:210, h:0.9 },   // L1 — modest
+      { capacity:240, upgradeCost:180, h:1.4 }, // L2 — meaningfully higher
+    ],
+  },
+  // The Design Studio is where models are developed. It feeds the sim NO capacity;
+  // its only campus input is presence/level, reported by deriveCampusInputs and
+  // consumed by the shell to gate (and sweeten) the car-design flow.
+  studio: {
+    type:'studio', name:'Design Studio', w:3, d:2, maxLevel:2, color:'#7C6FD6',
+    levels: [
+      null,
+      { placeCost:140, h:0.8 },     // L1 — one project at a time, normal cost
+      { upgradeCost:150, h:1.2 },   // L2 — cheaper refreshes (shell applies the perk)
+    ],
+  },
+};
+
+// ── pure campus logic (no canvas, headless-testable) ──────────────────────────
+function def(type){ return CATALOG[type]; }
+
+function freshCampus(){
+  // Start with one L1 assembly plant already standing, so baseline capacity is
+  // BASE_CAPACITY + 120 = 180k — exactly the sim's old capacityStart, keeping the
+  // balance intact. The founding plant is free (it's the plant you start with).
+  const campus = { objects:[], selectedId:null, cashSpentOnCampus:0, nextId:1 };
+  campus.objects.push({ id:campus.nextId++, type:'assembly', x:1, y:2, level:1,
+                        state:'operating', lastOutput:0 });
+  return campus;
+}
+
+function footprintOf(o){ const d=def(o.type); return { x:o.x, y:o.y, w:d.w, d:d.d }; }
+function rectsOverlap(a,b){ return a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.d && a.y+a.d > b.y; }
+
+function inBounds(type,x,y){
+  const d=def(type);
+  return x>=0 && y>=0 && x+d.w<=GRID_W && y+d.d<=GRID_D;
+}
+function collides(campus,type,x,y,ignoreId){
+  const d=def(type), cand={x,y,w:d.w,d:d.d};
+  return campus.objects.some(o=> o.id!==ignoreId && rectsOverlap(cand, footprintOf(o)));
+}
+function canPlace(campus,type,x,y){ return inBounds(type,x,y) && !collides(campus,type,x,y,null); }
+
+function placeCostOf(type){ return def(type).levels[1].placeCost; }
+function upgradeCostOf(o){
+  const d=def(o.type);
+  return o.level>=d.maxLevel ? null : d.levels[o.level+1].upgradeCost;
+}
+function capacityOf(o){
+  return (o.type==='assembly' && o.state==='operating') ? def(o.type).levels[o.level].capacity : 0;
+}
+
+// THE ADAPTER (B4): campus state → sim inputs. Only `capacity` is consumed by the
+// sim tonight; the rest are placeholders kept so future buildings can feed them.
+function deriveCampusInputs(campus){
+  let capacity = BASE_CAPACITY;
+  let studioPresent = false, studioLevel = 0;
+  campus.objects.forEach(o => {
+    capacity += capacityOf(o);
+    if(o.type==='studio'){ studioPresent = true; if(o.level>studioLevel) studioLevel = o.level; }
+  });
+  return { capacity, designStudio:{ present:studioPresent, level:studioLevel },
+           rdBonuses:{}, segmentUnlocks:[], brandBonus:0, manufacturingBonus:0 };
+}
+
+// mutating ops — pure over (campus, cash). cashSpentOnCampus is a campus-local
+// tally; the actual sim cash deduction is the shell's job via onSpend().
+function place(campus, type, x, y, cash){
+  if(!inBounds(type,x,y))             return { ok:false, reason:'Out of bounds.' };
+  if(collides(campus,type,x,y,null))  return { ok:false, reason:'Overlaps another building.' };
+  const cost = placeCostOf(type);
+  if(cash < cost)                     return { ok:false, reason:'Not enough cash.' };
+  const o = { id:campus.nextId++, type, x, y, level:1, state:'operating', lastOutput:0 };
+  campus.objects.push(o);
+  campus.cashSpentOnCampus += cost;
+  return { ok:true, cost, id:o.id };
+}
+function upgrade(campus, id, cash){
+  const o = campus.objects.find(o=>o.id===id);
+  if(!o)                return { ok:false, reason:'No such building.' };
+  const cost = upgradeCostOf(o);
+  if(cost==null)        return { ok:false, reason:'Already at max level.' };
+  if(cash < cost)       return { ok:false, reason:'Not enough cash.' };
+  o.level++; campus.cashSpentOnCampus += cost;
+  return { ok:true, cost, level:o.level };
+}
+function canDemolish(campus, id){
+  const o = campus.objects.find(o=>o.id===id); if(!o) return false;
+  if(o.type!=='assembly') return true;   // only plants are protected; studios are free to remove
+  // "demolish-if-safe": you must keep at least one assembly plant standing.
+  return campus.objects.filter(x=>x.type==='assembly').length > 1;
+}
+function demolish(campus, id){
+  if(!canDemolish(campus,id)) return { ok:false, reason:'You must keep at least one plant.' };
+  campus.objects = campus.objects.filter(o=>o.id!==id);
+  if(campus.selectedId===id) campus.selectedId = null;
+  return { ok:true };
+}
+
+// readout only: split last quarter's built units across plants by capacity share.
+function applyProduction(campus, totalUnits){
+  const inputs = deriveCampusInputs(campus);
+  campus.objects.forEach(o=>{
+    if(o.type==='assembly'){
+      o.lastOutput = inputs.capacity>0
+        ? +(totalUnits * (capacityOf(o)/inputs.capacity)).toFixed(1) : 0;
+    }
+  });
+}
+
+// ── stateful layer (canvas + interaction) ────────────────────────────────────
+let cv, ctx, W=0, H=0, DPR=1;
+let campus = freshCampus();
+let opts = {};                 // { menuEl, inspectorEl, getCash, onSpend, onChange }
+let buildType = null;          // current build-mode type, or null
+let ghost = { x:0, y:0, on:false };
+let hoverId = null;
+let wT = 0, rafId = 0;
+
+// ── iso projection (with user pan + zoom) ────────────────────────────────────
+const TW=46, TH=23, ZS=20;
+let view = { ox:0, oy:0, sc:1 };
+let panX = 0, panY = 0, zoom = 1;              // user QoL transform layered on fit()
+function effOx(){ return view.ox + panX; }
+function effOy(){ return view.oy + panY; }
+function effSc(){ return view.sc * zoom; }
+function resize(){
+  if(!cv) return;
+  DPR = Math.min(window.devicePixelRatio||1, 2);
+  W = cv.clientWidth; H = cv.clientHeight;
+  cv.width = W*DPR; cv.height = H*DPR;
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+function fit(){
+  view.sc = Math.max(0.55, Math.min(W/620, H/360, 1.5));
+  view.ox = W*0.5;
+  view.oy = H*0.30;
+}
+function iso(x,y,z){
+  const sc = effSc();
+  return { x: effOx() + (x-y)*(TW/2)*sc,
+           y: effOy() + (x+y)*(TH/2)*sc - (z||0)*ZS*sc };
+}
+// screen → tile (top-left of footprint cell under the cursor)
+function screenToTile(sx,sy){
+  const sc = effSc();
+  const a = (sx-effOx())/((TW/2)*sc), b = (sy-effOy())/((TH/2)*sc);
+  return { x: Math.floor((a+b)/2), y: Math.floor((b-a)/2) };
+}
+
+// ── colour helpers ───────────────────────────────────────────────────────────
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+function shade(hex,amt){
+  const n=parseInt(hex.slice(1),16);
+  const r=clamp(((n>>16)&255)+amt,0,255)|0, g=clamp(((n>>8)&255)+amt,0,255)|0, b=clamp((n&255)+amt,0,255)|0;
+  return `rgb(${r},${g},${b})`;
+}
+function quad(a,b,c,d){ ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.lineTo(c.x,c.y); ctx.lineTo(d.x,d.y); ctx.closePath(); ctx.fill(); }
+function tile(x,y,fill,stroke){
+  const a=iso(x,y,0),b=iso(x+1,y,0),c=iso(x+1,y+1,0),d=iso(x,y+1,0);
+  ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.lineTo(c.x,c.y); ctx.lineTo(d.x,d.y); ctx.closePath();
+  ctx.fillStyle=fill; ctx.fill();
+  if(stroke){ ctx.strokeStyle=stroke; ctx.lineWidth=1; ctx.stroke(); }
+}
+function prism(x,y,w,d,h,col,opt){
+  opt=opt||{};
+  const top=opt.top||col, right=opt.right||shade(col,-24), left=opt.left||shade(col,-48);
+  let A,B,C,D;
+  A=iso(x+w,y,0); B=iso(x+w,y+d,0); C=iso(x+w,y+d,h); D=iso(x+w,y,h); ctx.fillStyle=right; quad(A,B,C,D);
+  A=iso(x,y+d,0); B=iso(x+w,y+d,0); C=iso(x+w,y+d,h); D=iso(x,y+d,h); ctx.fillStyle=left; quad(A,B,C,D);
+  A=iso(x,y,h); B=iso(x+w,y,h); C=iso(x+w,y+d,h); D=iso(x,y+d,h); ctx.fillStyle=top; quad(A,B,C,D);
+  if(opt.outline){ ctx.strokeStyle=opt.outline; ctx.lineWidth=opt.outlineW||1.4; ctx.stroke(); }
+}
+
+// ── render ───────────────────────────────────────────────────────────────────
+function render(){
+  if(!ctx) return;
+  if(buildType && mouseInside) computeGhost(mouseSX, mouseSY);   // keep the ghost live
+  ctx.clearRect(0,0,W,H);
+  // sky/ground backdrop
+  const g=ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'#0e1320'); g.addColorStop(1,'#141b2b');
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+
+  // ground tiles
+  for(let x=0;x<GRID_W;x++) for(let y=0;y<GRID_D;y++){
+    const lot = (x+y)%2===0 ? '#283142' : '#2d3749';
+    tile(x,y,lot,'rgba(255,255,255,.05)');
+  }
+
+  // build-mode ghost footprint highlight (under buildings)
+  if(buildType && ghost.on){
+    const d=def(buildType), valid=ghost.valid;
+    for(let gx=ghost.x; gx<ghost.x+d.w; gx++) for(let gy=ghost.y; gy<ghost.y+d.d; gy++){
+      if(gx<0||gy<0||gx>=GRID_W||gy>=GRID_D) continue;
+      tile(gx,gy, valid?'rgba(79,208,138,.32)':'rgba(229,96,94,.30)', valid?'rgba(79,208,138,.9)':'rgba(229,96,94,.85)');
+    }
+  }
+
+  // buildings, depth-sorted by footprint far corner
+  const drawList = campus.objects.map(o=>({ o, z:o.x+o.y }));
+  drawList.sort((a,b)=>a.z-b.z);
+  for(const it of drawList) drawBuilding(it.o);
+
+  // ghost building silhouette + a one-line hint (snapped / why-invalid)
+  if(buildType && ghost.on && inBounds(buildType,ghost.x,ghost.y)){
+    const d=def(buildType), lv=d.levels[1], col = ghost.valid ? '#4FD08A' : '#E5605E';
+    ctx.globalAlpha=0.55;
+    prism(ghost.x+0.06, ghost.y+0.06, d.w-0.12, d.d-0.12, lv.h, col, {outline:col, outlineW:1.8});
+    ctx.globalAlpha=1;
+    const p=iso(ghost.x+d.w/2, ghost.y, lv.h+0.7);
+    ctx.textAlign='center'; ctx.font=`600 ${10*effSc()}px IBM Plex Mono,monospace`;
+    if(!ghost.valid && ghost.reason){ ctx.fillStyle='#ffb4b2'; ctx.fillText(ghost.reason, p.x, p.y); }
+    else if(ghost.snapped){ ctx.fillStyle='rgba(120,230,170,.95)'; ctx.fillText('↳ nearest open spot', p.x, p.y); }
+  }
+}
+
+function drawBuilding(o){
+  const d=def(o.type), lv=d.levels[o.level];
+  const selected = campus.selectedId===o.id, hover = hoverId===o.id;
+  const base = d.color;
+  const col = selected ? shade(base,28) : (hover ? shade(base,14) : base);
+  // pad slightly inside the footprint so tiles read as a lot
+  prism(o.x+0.08, o.y+0.08, d.w-0.16, d.d-0.16, lv.h, col,
+    { outline: selected?'#F2A33C':'rgba(0,0,0,.25)', outlineW: selected?2.4:1 });
+  // roof detail: a sawtooth stripe + level pips
+  const rz=lv.h;
+  ctx.fillStyle=shade(col,-10);
+  for(let s=o.x+0.4; s<o.x+d.w-0.2; s+=0.7){
+    const a=iso(s,o.y+0.2,rz), b=iso(s+0.18,o.y+0.2,rz), c=iso(s+0.18,o.y+d.d-0.2,rz), e=iso(s,o.y+d.d-0.2,rz);
+    quad(a,b,c,e);
+  }
+  // label
+  const p=iso(o.x+d.w/2, o.y+d.d/2, rz+0.5);
+  ctx.fillStyle = selected?'#F2A33C':'#cdd3db';
+  ctx.font=`600 ${11*effSc()}px IBM Plex Mono,monospace`; ctx.textAlign='center';
+  ctx.fillText(`${d.name.split(' ')[0]} L${o.level}`, p.x, p.y);
+  // utilization bar floating above when operating
+  const cap=capacityOf(o);
+  if(cap>0){
+    const util=clamp(o.lastOutput/cap,0,1);
+    const bw=34*effSc(), bx=p.x-bw/2, by=p.y+5*effSc();
+    ctx.fillStyle='rgba(0,0,0,.45)'; ctx.fillRect(bx,by,bw,4*effSc());
+    ctx.fillStyle = util>0.92?'#E5605E':'#4FD08A'; ctx.fillRect(bx,by,bw*util,4*effSc());
+  }
+}
+
+// ── interaction: armed click-to-place (RCT/SimCity style) + forgiving pan/zoom ──
+// The build tool is "armed" (buildType set); a single CLICK places at the ghost — no
+// dragging. Panning only happens on a clear drag (>PAN_THRESH) that starts on empty
+// space, or any space-bar drag; a small movement is always a click and never pans.
+const PAN_THRESH = 6;
+let mouseDown=false, panEligible=false, wasPan=false;
+let downX=0, downY=0, downPanX=0, downPanY=0;
+let mouseSX=0, mouseSY=0, mouseInside=false, spaceHeld=false;
+
+function relPos(ev){ const r=cv.getBoundingClientRect(); return { x:ev.clientX-r.left, y:ev.clientY-r.top }; }
+
+// nearest valid top-left tile to (cx,cy) for `type`, or null if the grid is full
+function nearestOpen(type, cx, cy){
+  const d=def(type); let best=null, bd=Infinity;
+  for(let y=0; y<=GRID_D-d.d; y++) for(let x=0; x<=GRID_W-d.w; x++){
+    if(!canPlace(campus,type,x,y)) continue;
+    const dx=x-cx, dy=y-cy, dd=dx*dx+dy*dy;
+    if(dd<bd){ bd=dd; best={x,y}; }
+  }
+  return best;
+}
+
+// ghost from screen coords: sit on the cursor tile if valid, else auto-snap to the
+// nearest open spot, else mark invalid with a one-line reason.
+function computeGhost(sx,sy){
+  if(!buildType){ ghost.on=false; return; }
+  const d=def(buildType), t=screenToTile(sx,sy);
+  const x=clamp(t.x,0,GRID_W-d.w), y=clamp(t.y,0,GRID_D-d.d);
+  ghost.on=true; ghost.snapped=false; ghost.reason='';
+  const cost=placeCostOf(buildType);
+  if(opts.getCash && opts.getCash() < cost){ ghost.x=x; ghost.y=y; ghost.valid=false; ghost.reason="Can't afford ($"+cost+"M)"; return; }
+  if(canPlace(campus,buildType,x,y)){ ghost.x=x; ghost.y=y; ghost.valid=true; return; }
+  const near=nearestOpen(buildType,x,y);
+  if(near){ ghost.x=near.x; ghost.y=near.y; ghost.valid=true; ghost.snapped=true; }
+  else { ghost.x=x; ghost.y=y; ghost.valid=false; ghost.reason='No room — demolish a plant first'; }
+}
+
+function setCursor(){
+  if(!cv) return;
+  cv.style.cursor = wasPan ? 'grabbing'
+    : buildType ? 'crosshair'
+    : spaceHeld ? 'grab'
+    : (hoverId ? 'pointer' : 'grab');
+}
+function disarm(){ buildType=null; ghost.on=false; wasPan=false; renderPanels(); setCursor(); }
+
+function onDown(ev){
+  if(!cv || ev.button!==0) return;
+  mouseDown=true; wasPan=false;
+  downX=ev.clientX; downY=ev.clientY; downPanX=panX; downPanY=panY;
+  const pos=relPos(ev), t=screenToTile(pos.x,pos.y);
+  // pan starts only from empty space (or whenever space is held) — never from a click on a building
+  panEligible = spaceHeld || (pickAt(t.x,t.y)==null);
+}
+function onUp(){ mouseDown=false; setCursor(); }
+function onMove(ev){
+  if(!cv) return;
+  const pos=relPos(ev); mouseSX=pos.x; mouseSY=pos.y; mouseInside=true;
+  if(mouseDown){
+    const dx=ev.clientX-downX, dy=ev.clientY-downY;
+    if(!wasPan && panEligible && Math.hypot(dx,dy)>PAN_THRESH) wasPan=true;
+    if(wasPan){ panX=downPanX+dx; panY=downPanY+dy; setCursor(); return; }
+  }
+  if(buildType){ computeGhost(mouseSX,mouseSY); }
+  else { const t=screenToTile(mouseSX,mouseSY); hoverId=pickAt(t.x,t.y); }
+  setCursor();
+}
+function onLeave(){ ghost.on=false; hoverId=null; mouseDown=false; wasPan=false; mouseInside=false; }
+function onWheel(ev){
+  if(!cv) return;
+  ev.preventDefault();
+  const pos=relPos(ev), mx=pos.x, my=pos.y;
+  const target = clamp(zoom * (ev.deltaY < 0 ? 1.12 : 0.89), 0.6, 2.4);
+  const k = target / zoom;
+  panX = (mx - (mx - effOx())*k) - view.ox;
+  panY = (my - (my - effOy())*k) - view.oy;
+  zoom = target;
+}
+function onContext(ev){ ev.preventDefault(); if(buildType) disarm(); }    // right-click cancels
+function onKeyDown(ev){
+  if(ev.code==='Space'){ spaceHeld=true; setCursor(); }
+  else if(ev.key==='Escape' && buildType){ disarm(); }
+}
+function onKeyUp(ev){ if(ev.code==='Space'){ spaceHeld=false; setCursor(); } }
+
+function pickAt(tx,ty){
+  // topmost (last drawn) building whose footprint contains the tile
+  let found=null;
+  campus.objects.forEach(o=>{ const f=footprintOf(o); if(tx>=f.x&&tx<f.x+f.w&&ty>=f.y&&ty<f.y+f.d) found=o.id; });
+  return found;
+}
+function onClick(ev){
+  if(!cv) return;
+  if(wasPan){ wasPan=false; return; }          // that was a pan, not a click
+  const pos=relPos(ev);
+  if(buildType){
+    computeGhost(pos.x, pos.y);
+    if(!ghost.valid){ flash(ghost.reason || 'Invalid spot'); return; }
+    const cash = opts.getCash? opts.getCash():Infinity;
+    const res = place(campus, buildType, ghost.x, ghost.y, cash);
+    if(res.ok){
+      if(opts.onSpend) opts.onSpend(res.cost);
+      campus.selectedId = res.id;
+      changed();
+      // stay armed for rapid placement; disarm only if the next one is unaffordable
+      if(opts.getCash && opts.getCash() < placeCostOf(buildType)) disarm();
+      else { computeGhost(pos.x, pos.y); setCursor(); }
+    } else { flash(res.reason); }
+  } else {
+    const t=screenToTile(pos.x,pos.y);
+    const id = pickAt(t.x,t.y) || null;
+    campus.selectedId = id;
+    renderPanels();
+    notifySelect();
+    // a Design Studio's primary effect is to open the car-design flow on click
+    const sel = campus.objects.find(o=>o.id===id);
+    if(sel && sel.type==='studio' && opts.onStudioOpen) opts.onStudioOpen();
+  }
+}
+let flashMsg='', flashT=0;
+function flash(msg){ flashMsg=msg; flashT=2.2; renderPanels(); }
+
+// tell the shell which plant is selected so it can focus the factory interior
+function notifySelect(){
+  if(!opts.onSelect) return;
+  opts.onSelect(campus.objects.find(o => o.id === campus.selectedId) || null);
+}
+
+function changed(){
+  renderPanels();
+  notifySelect();
+  if(opts.onChange) opts.onChange();   // shell re-applies capacity to sim + autosaves
+}
+
+// ── DOM: build menu + inspector (owned by the world, rendered into shell slots)─
+function renderPanels(){
+  renderMenu();
+  renderInspector();
+}
+const BUILDABLE = ['assembly','studio'];
+function renderMenu(){
+  if(!opts.menuEl) return;
+  const cash = opts.getCash? Math.round(opts.getCash()):0;
+  const inputs = deriveCampusInputs(campus);
+  const studio = inputs.designStudio;
+  const btns = BUILDABLE.map(type=>{
+    const d=def(type), cost=placeCostOf(type), can=cash>=cost, armed=buildType===type;
+    return `<button class="wbuild-btn${armed?' on':''}" ${(can||armed)?'':'disabled'}
+       onclick="MarqueWorld.toggleBuild('${type}')">
+       ${armed?'✕ Cancel' : '+ '+d.name} <span>$${cost}M</span>
+     </button>`;
+  }).join('');
+  const hint = buildType
+    ? `<b style="color:var(--amber)">● Armed</b> — click any tile to build (stays armed for more). <b>Esc</b> or right-click to cancel.`
+    : `Plants add capacity (now <b>${inputs.capacity}k</b>/q). The <b style="color:#a89bf0">Design Studio</b> is where you develop &amp; redesign models${studio.present?` — you have one (L${studio.level}).`:` — build one to design in-game.`}`;
+  opts.menuEl.innerHTML = btns +
+    `<div class="wbuild-hint">${hint}${flashT>0?` <span style="color:var(--red)">· ${flashMsg}</span>`:''}</div>`;
+}
+function renderInspector(){
+  if(!opts.inspectorEl) return;
+  const o = campus.objects.find(x=>x.id===campus.selectedId);
+  if(!o){ opts.inspectorEl.innerHTML = `<div class="winsp-empty">Select a building to inspect it.</div>`; return; }
+  if(o.type==='studio'){
+    const d=def(o.type);
+    const upCost=upgradeCostOf(o);
+    const cash = opts.getCash? opts.getCash():0;
+    const canUp = upCost!=null && cash>=upCost;
+    const status = (opts.getStudioStatus && opts.getStudioStatus()) || 'Idle';
+    const perk = o.level>=2 ? 'Refreshes cost 30% less' : 'L2 makes refreshes 30% cheaper';
+    opts.inspectorEl.innerHTML =
+      `<div class="winsp-name">${d.name} <span class="winsp-lvl">Level ${o.level}</span></div>
+       <div class="winsp-grid">
+         <div><span class="wk">Status</span><span class="wv">${status}</span></div>
+         <div><span class="wk">Projects</span><span class="wv">1 at a time</span></div>
+         <div><span class="wk">Perk</span><span class="wv" style="font-size:11px">${perk}</span></div>
+         <div><span class="wk">Footprint</span><span class="wv">${d.w}×${d.d}</span></div>
+       </div>
+       <div class="winsp-actions">
+         <button class="btn primary" onclick="MarqueWorld.studioAction()">Design / Redesign ▸</button>
+         ${upCost!=null
+           ? `<button class="btn" ${canUp?'':'disabled'} onclick="MarqueWorld.upgradeSelected()">Upgrade to L${o.level+1} · $${upCost}M</button>`
+           : `<button class="btn" disabled>Max level</button>`}
+         <button class="btn danger" onclick="MarqueWorld.demolishSelected()">Demolish</button>
+       </div>`;
+    return;
+  }
+  const d=def(o.type), cap=capacityOf(o), util=cap>0?Math.round(clamp(o.lastOutput/cap,0,1)*100):0;
+  const upCost=upgradeCostOf(o);
+  const cash = opts.getCash? opts.getCash():0;
+  const canUp = upCost!=null && cash>=upCost;
+  const canDem = canDemolish(campus,o.id);
+  opts.inspectorEl.innerHTML =
+    `<div class="winsp-name">${d.name} <span class="winsp-lvl">Level ${o.level}</span></div>
+     <div class="winsp-grid">
+       <div><span class="wk">Capacity</span><span class="wv">${cap}k/q</span></div>
+       <div><span class="wk">Last output</span><span class="wv">${Math.round(o.lastOutput)}k</span></div>
+       <div><span class="wk">Utilization</span><span class="wv" style="color:${util>92?'var(--red)':'var(--green)'}">${util}%</span></div>
+       <div><span class="wk">Footprint</span><span class="wv">${d.w}×${d.d}</span></div>
+     </div>
+     <div class="winsp-actions">
+       ${upCost!=null
+         ? `<button class="btn primary" ${canUp?'':'disabled'} onclick="MarqueWorld.upgradeSelected()">Upgrade to L${o.level+1} · $${upCost}M</button>`
+         : `<button class="btn" disabled>Max level</button>`}
+       <button class="btn danger" ${canDem?'':'disabled'} onclick="MarqueWorld.demolishSelected()" title="${canDem?'':'Keep at least one plant'}">Demolish</button>
+     </div>`;
+}
+
+// ── public actions wired to DOM ──────────────────────────────────────────────
+function toggleBuild(type){
+  buildType = (buildType===type) ? null : type;
+  ghost.on=false;
+  if(buildType && mouseInside) computeGhost(mouseSX, mouseSY);
+  renderPanels(); setCursor();
+}
+function upgradeSelected(){
+  const id=campus.selectedId; if(id==null) return;
+  const cash=opts.getCash?opts.getCash():Infinity;
+  const res=upgrade(campus,id,cash);
+  if(res.ok){ if(opts.onSpend) opts.onSpend(res.cost); changed(); } else flash(res.reason);
+}
+function demolishSelected(){
+  const id=campus.selectedId; if(id==null) return;
+  const res=demolish(campus,id);
+  if(res.ok) changed(); else flash(res.reason);
+}
+function studioAction(){ if(opts.onStudioOpen) opts.onStudioOpen(); }
+
+// ── lifecycle ────────────────────────────────────────────────────────────────
+function step(dt){
+  wT += dt;
+  if(flashT>0){ flashT-=dt; if(flashT<=0){ flashT=0; renderMenu(); } }
+}
+let last=0;
+function loop(now){
+  if(!cv) return;
+  let dt=(now-last)/1000; last=now; dt=Math.min(dt,0.05);
+  step(dt); render();
+  rafId=requestAnimationFrame(loop);
+}
+
+function init(canvasEl, options){
+  opts = options||{};
+  if(canvasEl){
+    cv=canvasEl; ctx=cv.getContext('2d');
+    resize(); fit();
+    window.addEventListener('resize', ()=>{ resize(); fit(); });
+    cv.addEventListener('mousedown', onDown);
+    window.addEventListener('mouseup', onUp);
+    cv.addEventListener('mousemove', onMove);
+    cv.addEventListener('mouseleave', onLeave);
+    cv.addEventListener('click', onClick);
+    cv.addEventListener('wheel', onWheel, { passive:false });
+    cv.addEventListener('contextmenu', onContext);
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    cv.style.cursor = 'grab';
+    last=performance.now();
+    if(rafId) cancelAnimationFrame(rafId);
+    rafId=requestAnimationFrame(loop);
+  }
+  renderPanels();
+}
+
+function getCampus(){ return campus; }
+function loadCampus(state){
+  if(state && Array.isArray(state.objects)){
+    campus = state;
+    if(campus.nextId==null) campus.nextId = Math.max(0,...campus.objects.map(o=>o.id))+1;
+  } else {
+    campus = freshCampus();
+  }
+  buildType=null; ghost.on=false; panX=0; panY=0; zoom=1;
+  renderPanels();
+}
+function resetCampus(){ campus = freshCampus(); buildType=null; panX=0; panY=0; zoom=1; renderPanels(); }
+
+return {
+  // logic (also used by headless tests)
+  freshCampus, deriveCampusInputs, canPlace, place, upgrade, demolish,
+  canDemolish, applyProduction, placeCostOf, upgradeCostOf, capacityOf,
+  CATALOG, GRID_W, GRID_D, BASE_CAPACITY,
+  // lifecycle / shell wiring
+  init, getCampus, loadCampus, resetCampus, step, render, renderPanels,
+  toggleBuild, upgradeSelected, demolishSelected, studioAction,
+};
+
+})();
+
+</script>
+<style>
+  :root{
+    --bg:#15171C; --panel:#1D2026; --panel2:#22262E; --line:#2E333D;
+    --hi:#ECEEF1; --dim:#8A9099; --dimmer:#5C636E;
+    --amber:#F2A33C; --green:#4FD08A; --red:#E5605E;
+    --mono:'IBM Plex Mono',ui-monospace,monospace;
+    --sans:'Archivo',system-ui,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--hi);font-family:var(--sans);-webkit-font-smoothing:antialiased}
+  body{padding:18px;max-width:1200px;margin:0 auto}
+  .mono{font-family:var(--mono)}
+  .dim{color:var(--dim)} .up{color:var(--green)} .down{color:var(--red)}
+
+  /* ── header ── */
+  header{display:flex;flex-wrap:wrap;align-items:flex-end;gap:16px;
+    border-bottom:1px solid var(--line);padding-bottom:16px;margin-bottom:18px}
+  .brandmark{display:flex;flex-direction:column;gap:2px;margin-right:auto}
+  .brandmark .nm{font-weight:800;font-size:26px;letter-spacing:.06em;text-transform:uppercase;line-height:1}
+  .brandmark .nm .dot{color:var(--amber)}
+  .brandmark .sub{font-family:var(--mono);font-size:11px;color:var(--dim);letter-spacing:.18em;text-transform:uppercase}
+  .clock{font-family:var(--mono);font-size:13px;color:var(--dim);
+    border:1px solid var(--line);border-radius:6px;padding:6px 10px;letter-spacing:.1em}
+  .clock b{color:var(--amber);font-weight:600}
+  .run-ctl{display:flex;gap:6px}
+  .run-ctl button{font-family:var(--mono);font-size:11px;letter-spacing:.04em;
+    background:transparent;color:var(--dim);border:1px solid var(--line);
+    border-radius:6px;padding:6px 11px;cursor:pointer;transition:.12s}
+  .run-ctl button:hover{color:var(--hi);border-color:rgba(255,255,255,.25)}
+  .run-ctl button:disabled{opacity:.3;cursor:not-allowed}
+  .cluster{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;width:100%;margin-top:4px}
+  .gauge{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+  .gauge .lbl{font-family:var(--mono);font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim)}
+  .gauge .val{font-family:var(--mono);font-size:22px;font-weight:600;margin-top:5px;line-height:1}
+  .gauge .delta{font-family:var(--mono);font-size:11px;margin-top:5px}
+
+  /* ── layout ── */
+  .grid{display:grid;grid-template-columns:1.55fr 1fr;gap:18px;align-items:start}
+  @media(max-width:900px){.grid{grid-template-columns:1fr}.cluster{grid-template-columns:repeat(2,1fr)}}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:18px}
+  .panel h2{font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--dim);margin:0 0 14px;font-weight:600;font-family:var(--mono)}
+
+  /* ── segment cards ── */
+  .seg{border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:12px;background:var(--panel2)}
+  .seg:last-child{margin-bottom:0}
+  .seg-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px}
+  .seg-name{font-weight:700;font-size:15px}
+  .seg-meta{font-family:var(--mono);font-size:11px;color:var(--dim)}
+
+  .model-row{display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap}
+  .model-badge{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:9px 12px;min-width:130px}
+  .model-badge .eng{font-family:var(--mono);font-size:20px;font-weight:600;color:var(--amber);line-height:1}
+  .model-badge .trm{font-family:var(--mono);font-size:11px;color:var(--dim);margin-top:2px}
+  .nov-bar{height:3px;background:var(--line);border-radius:2px;margin-top:8px;overflow:hidden}
+  .nov-bar i{display:block;height:100%;border-radius:2px}
+  .nov-lbl{font-family:var(--mono);font-size:9px;color:var(--dimmer);margin-top:3px;letter-spacing:.1em;text-transform:uppercase}
+  .recall-badge{font-family:var(--mono);font-size:9px;color:var(--red);letter-spacing:.1em;text-transform:uppercase;margin-top:4px;display:block}
+  .halo-badge{font-family:var(--mono);font-size:9px;color:#F2B544;letter-spacing:.08em;text-transform:uppercase;margin-top:4px}
+
+  .price-ctl{flex:1;min-width:180px}
+  .price-row{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px}
+  .price-row .k{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim)}
+  .price-row .v{font-family:var(--mono);font-size:20px;font-weight:600;color:var(--amber)}
+  input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:4px;background:var(--line);border-radius:2px;outline:none}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:var(--amber);cursor:pointer;border:2px solid var(--bg);box-shadow:0 0 0 1px var(--amber)}
+  input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:var(--amber);cursor:pointer;border:2px solid var(--bg)}
+  .share-proj{font-family:var(--mono);font-size:11px;color:var(--dim);margin-top:7px}
+  .share-proj b{color:var(--hi);font-weight:600}
+
+  .seg-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
+  .btn{font-family:var(--mono);font-size:11px;letter-spacing:.06em;background:transparent;
+    color:var(--dim);border:1px solid var(--line);border-radius:7px;padding:6px 10px;cursor:pointer;transition:.12s}
+  .btn:hover{color:var(--hi);border-color:rgba(255,255,255,.25)} .btn:active{transform:translateY(1px)}
+  .btn:disabled{opacity:.3;cursor:not-allowed;pointer-events:none}
+  .btn.primary{background:var(--amber);color:#10141C;border-color:var(--amber);font-weight:600}
+  .btn.primary:hover{filter:brightness(1.08)}
+  .btn.danger{color:var(--red);border-color:rgba(229,96,94,.3)}
+  .btn.danger:hover{border-color:var(--red);background:rgba(229,96,94,.08)}
+
+  /* ── car icons ── */
+  .cars{display:flex;flex-wrap:wrap;gap:3px;margin-top:10px;min-height:14px;align-items:center}
+  .cars svg{width:18px;height:9px;opacity:.9}
+  .cars .units{font-family:var(--mono);font-size:10px;color:var(--dim);margin-left:6px}
+
+  /* ── design picker ── */
+  .design-picker{background:var(--bg);border:1px solid var(--amber);border-radius:8px;padding:13px;margin-top:10px}
+  .pk-lbl{font-family:var(--mono);font-size:9px;letter-spacing:.18em;text-transform:uppercase;color:var(--dim);margin-bottom:5px}
+  .pk-row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+  .pk-btn{font-family:var(--mono);font-size:11px;background:var(--panel2);color:var(--dim);
+    border:1px solid var(--line);border-radius:6px;padding:5px 9px;cursor:pointer;transition:.12s}
+  .pk-btn:hover{color:var(--hi);border-color:rgba(255,255,255,.2)}
+  .pk-btn.sel{background:var(--amber);color:#10141C;border-color:var(--amber);font-weight:600}
+  .pk-btn:disabled{opacity:.3;cursor:not-allowed;pointer-events:none}
+  .pk-eng-detail{font-family:var(--mono);font-size:10px;color:var(--dim);margin-bottom:8px}
+  .pk-eng-detail b{color:var(--hi)}
+  .design-cost-line{font-family:var(--mono);font-size:11px;color:var(--dim);margin-bottom:10px;padding:7px 9px;background:var(--panel2);border-radius:6px}
+  .design-cost-line b{color:var(--amber)}
+  .pk-actions{display:flex;gap:6px}
+
+  /* ── share bar ── */
+  .sharebar{display:flex;height:7px;border-radius:4px;overflow:hidden;margin-top:12px;background:var(--bg)}
+  .sharebar span{display:block;height:100%;transition:width .18s}
+  .leg{display:flex;gap:10px;flex-wrap:wrap;margin-top:7px}
+  .leg .it{display:flex;align-items:center;gap:5px;font-family:var(--mono);font-size:10px;color:var(--dim)}
+  .leg .sw{width:8px;height:8px;border-radius:2px;display:inline-block;flex-shrink:0}
+
+  .no-model{font-family:var(--mono);font-size:12px;color:var(--dimmer);padding:6px 0 2px}
+
+  /* ── R&D ── */
+  .rd{margin-bottom:14px}
+  .rd .row{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:5px}
+  .rd .row .k{font-size:13px;font-weight:600}
+  .rd .row .k small{font-family:var(--mono);font-weight:400;color:var(--dim);font-size:10px;display:block;margin-top:1px}
+  .rd .row .v{font-family:var(--mono);font-size:15px;color:var(--amber);font-weight:600}
+  .statbar{height:4px;background:var(--line);border-radius:2px;margin-top:7px;overflow:hidden}
+  .statbar i{display:block;height:100%;background:var(--amber);border-radius:2px;transition:width .3s}
+  .rd-effect{font-family:var(--mono);font-size:9px;color:var(--dimmer);margin-top:4px;letter-spacing:.05em}
+  .rd-total{display:flex;justify-content:space-between;font-family:var(--mono);font-size:12px;
+    border-top:1px solid var(--line);padding-top:12px;margin-top:4px}
+  .rd-total b{font-weight:600}
+
+  /* ── factory ── */
+  .factory-row{display:flex;align-items:center;gap:12px;margin-bottom:10px}
+  .factory-stat{font-family:var(--mono);font-size:12px;color:var(--dim);white-space:nowrap}
+  .factory-stat b{color:var(--hi)}
+  .cap-bar{flex:1;height:6px;background:var(--line);border-radius:3px;overflow:hidden}
+  .cap-bar i{display:block;height:100%;border-radius:3px;transition:width .3s}
+
+  /* ── chart ── */
+  svg.chart{width:100%;height:150px;display:block}
+
+  /* ── log ── */
+  .log{font-family:var(--mono);font-size:12px;line-height:1.55}
+  .log .e{padding:7px 0;border-bottom:1px solid var(--line);color:var(--dim)}
+  .log .e:last-child{border-bottom:none}
+  .log .e b{color:var(--hi);font-weight:600}
+  .log .e .q{color:var(--dimmer);margin-right:8px}
+
+  /* ── advance ── */
+  .advance{position:sticky;bottom:14px;margin-top:6px;z-index:5}
+  #advBtn{width:100%;font-family:var(--sans);font-weight:800;font-size:16px;
+    letter-spacing:.08em;text-transform:uppercase;color:#10141C;background:var(--amber);
+    border:none;border-radius:12px;padding:16px;cursor:pointer;
+    box-shadow:0 6px 22px rgba(242,163,60,.28)}
+  #advBtn:hover{filter:brightness(1.06)} #advBtn:active{transform:translateY(1px)}
+  .gameover{text-align:center;padding:24px;border:1px solid var(--red);border-radius:12px;background:rgba(229,96,94,.08)}
+  .gameover h3{margin:0 0 6px;color:var(--red);letter-spacing:.05em}
+  .restart-btn{margin-top:14px;font-family:var(--mono);font-size:12px;background:transparent;
+    color:var(--hi);border:1px solid var(--line);border-radius:8px;padding:9px 16px;cursor:pointer}
+  .restart-btn:hover{border-color:var(--amber);color:var(--amber)}
+  .hint{font-family:var(--mono);font-size:11px;color:var(--dimmer);margin-top:12px;line-height:1.65}
+
+  /* ── goal banner ── */
+  #goalBanner{font-family:var(--mono);font-size:11px;color:var(--dim);
+    padding:0 0 14px;border-bottom:1px solid var(--line);margin-bottom:18px}
+  #goalBanner b{font-weight:600}
+
+  /* ── end screen ── */
+  .endcard{border-radius:12px;padding:22px 24px;border:1px solid var(--line)}
+  .endcard.win{border-color:var(--green);background:rgba(79,208,138,.06)}
+  .endcard.bankrupt{border-color:var(--red);background:rgba(229,96,94,.06)}
+  .endcard.timeout{border-color:var(--dimmer);background:rgba(92,99,110,.06)}
+  .endcard h3{margin:0 0 4px;font-size:22px;font-weight:800;letter-spacing:.04em}
+  .endcard .sub{font-family:var(--mono);font-size:11px;color:var(--dim);margin-bottom:16px}
+  .score-val{font-family:var(--mono);font-size:36px;font-weight:600;color:var(--amber);
+    line-height:1;margin-bottom:16px}
+  .score-val small{font-size:13px;color:var(--dim);font-weight:400;margin-left:4px}
+  .stat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px 16px;
+    margin-bottom:18px;font-family:var(--mono);font-size:11px}
+  .stat-grid .sk{color:var(--dim);margin-bottom:2px}
+  .stat-grid .sv{font-size:14px;font-weight:600;color:var(--hi)}
+  .endstory{font-family:var(--sans);font-size:14px;font-style:italic;color:var(--hi);
+    line-height:1.5;margin:4px 0 16px;padding-left:12px;border-left:2px solid var(--amber)}
+  .enddecisive{font-family:var(--mono);font-size:11px;color:var(--dim);margin:-6px 0 16px}
+  .enddecisive span{color:var(--amber);text-transform:uppercase;letter-spacing:.1em;font-size:9px;margin-right:6px}
+  .end-actions{display:flex;gap:8px;flex-wrap:wrap}
+  .end-actions button{font-family:var(--mono);font-size:12px;border-radius:8px;
+    padding:10px 16px;cursor:pointer;border:1px solid var(--line);background:transparent;
+    color:var(--hi);transition:.12s}
+  .end-actions button:hover{border-color:var(--amber);color:var(--amber)}
+  .end-actions .primary-end{background:var(--amber);color:#10141C;border-color:var(--amber);font-weight:700}
+  .end-actions .primary-end:hover{filter:brightness(1.08);color:#10141C}
+
+  /* ── campus builder (PART B) ── */
+  .campus{display:grid;grid-template-columns:1.7fr 1fr;gap:14px;margin-bottom:18px;align-items:stretch}
+  @media(max-width:760px){.campus{grid-template-columns:1fr}}
+  .campus-grid{position:relative;height:300px;border-radius:12px;overflow:hidden;
+    background:#0C0F15;border:1px solid var(--line)}
+  #worldCanvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+  .campus-title{position:absolute;top:8px;left:12px;font-family:var(--mono);font-size:9px;
+    letter-spacing:.18em;text-transform:uppercase;color:var(--dim);z-index:2}
+  .campus-side{display:flex;flex-direction:column;gap:12px}
+  .campus-panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+  .campus-panel h3{font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--dim);
+    margin:0 0 10px;font-weight:600;font-family:var(--mono)}
+  .wbuild-btn{width:100%;font-family:var(--mono);font-size:12px;font-weight:600;
+    display:flex;justify-content:space-between;align-items:center;
+    background:var(--amber);color:#10141C;border:none;border-radius:8px;padding:10px 12px;
+    cursor:pointer;transition:.12s}
+  .wbuild-btn.on{background:transparent;color:var(--amber);border:1px solid var(--amber)}
+  .wbuild-btn:hover{filter:brightness(1.05)}
+  .wbuild-btn:disabled{opacity:.35;cursor:not-allowed}
+  .wbuild-btn span{font-weight:400}
+  .wbuild-hint{font-family:var(--mono);font-size:10px;color:var(--dimmer);margin-top:9px;line-height:1.6}
+  .wbuild-hint b{color:var(--hi)}
+  .winsp-empty{font-family:var(--mono);font-size:11px;color:var(--dimmer);padding:6px 0}
+  .winsp-name{font-weight:700;font-size:14px;margin-bottom:10px}
+  .winsp-lvl{font-family:var(--mono);font-size:10px;color:var(--amber);margin-left:6px}
+  .winsp-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 12px;margin-bottom:12px}
+  .winsp-grid>div{display:flex;flex-direction:column}
+  .winsp-grid .wk{font-family:var(--mono);font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim)}
+  .winsp-grid .wv{font-family:var(--mono);font-size:15px;font-weight:600;color:var(--hi);margin-top:2px}
+  .winsp-actions{display:flex;gap:6px;flex-wrap:wrap}
+  .winsp-note{font-family:var(--mono);font-size:9px;color:var(--dimmer);margin-top:9px;letter-spacing:.04em}
+
+  /* ── factory hero ── */
+  .factory-hero{position:relative;width:100%;height:280px;border-radius:12px;
+    overflow:hidden;background:#0C0F15;margin-bottom:18px;border:1px solid var(--line)}
+  #factoryCanvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+  .factory-hud{position:absolute;bottom:0;left:0;right:0;
+    display:flex;justify-content:space-between;align-items:center;
+    padding:8px 14px;
+    background:linear-gradient(transparent,rgba(12,15,21,.82))}
+  .fhud-stat{font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:.07em}
+  .fhud-bar{display:flex;gap:6px;align-items:center}
+  .flbl{font-family:var(--mono);font-size:9px;color:var(--dimmer);
+    letter-spacing:.15em;text-transform:uppercase}
+  .fgrp{display:flex;gap:3px;padding:0 4px}
+  .fgrp+.fgrp{border-left:1px solid rgba(255,255,255,.08)}
+  .fgrp button{font-family:var(--mono);font-size:11px;background:transparent;
+    color:var(--dimmer);border:1px solid transparent;border-radius:7px;
+    padding:5px 9px;cursor:pointer;transition:.12s}
+  .fgrp button:hover{color:var(--hi)}
+  .fgrp button.on{background:rgba(242,163,60,.14);color:var(--amber);
+    border-color:rgba(242,163,60,.28)}
+
+  /* ── launch screen ── */
+  #launchOverlay,#studioOverlay{position:fixed;inset:0;z-index:100;background:rgba(10,12,18,.94);
+    display:none;align-items:center;justify-content:center;padding:20px}
+  .studio-actions{display:flex;flex-direction:column;gap:8px;margin-top:6px}
+  .studio-actions .btn{align-self:flex-start}
+  .btn.locked{opacity:.85;border-style:dashed;color:var(--dim)}
+  .no-model.locked{border-left:2px solid var(--amber);padding-left:9px}
+  .launch-card{background:var(--panel);border:1px solid var(--line);border-radius:16px;
+    padding:28px 32px;max-width:560px;width:100%;max-height:90vh;overflow-y:auto}
+  .launch-title{font-weight:800;font-size:20px;letter-spacing:.04em;margin-bottom:3px}
+  .launch-sub{font-family:var(--mono);font-size:11px;color:var(--dim);
+    letter-spacing:.14em;text-transform:uppercase;margin-bottom:22px}
+  .lnch-sec{margin-bottom:18px}
+  .lnch-sec-lbl{font-family:var(--mono);font-size:9px;letter-spacing:.2em;
+    text-transform:uppercase;color:var(--dim);margin-bottom:8px}
+  .lnch-opts{display:flex;gap:7px;flex-wrap:wrap}
+  .lnch-btn{font-family:var(--mono);font-size:12px;background:var(--panel2);
+    color:var(--dim);border:1px solid var(--line);border-radius:8px;
+    padding:7px 14px;cursor:pointer;transition:.12s;text-align:left;line-height:1.3}
+  .lnch-btn:hover{color:var(--hi);border-color:rgba(255,255,255,.2)}
+  .lnch-btn.sel{background:rgba(242,163,60,.12);color:var(--amber);border-color:var(--amber)}
+  .lnch-btn:disabled{opacity:.3;cursor:not-allowed}
+  .eng-card{padding:9px 13px;min-width:92px}
+  .eng-card .en{font-size:15px;font-weight:600;line-height:1;color:inherit;display:block;margin-bottom:3px}
+  .eng-card .ec{font-size:9px;color:var(--dim);line-height:1.5;display:block}
+  .lnch-btn.sel .ec{color:rgba(242,163,60,.7)}
+  .lnch-price-row{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px}
+  .lnch-price-v{font-family:var(--mono);font-size:22px;font-weight:600;color:var(--amber)}
+  .lnch-price-k{font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:.1em;text-transform:uppercase}
+  .lnch-cost-note{font-family:var(--mono);font-size:10px;color:var(--dimmer);margin-top:6px}
+  .lnch-launch-btn{width:100%;font-family:var(--sans);font-weight:800;font-size:15px;
+    letter-spacing:.08em;text-transform:uppercase;color:#10141C;background:var(--amber);
+    border:none;border-radius:10px;padding:14px;cursor:pointer;
+    box-shadow:0 4px 18px rgba(242,163,60,.28);margin-top:6px}
+  .lnch-launch-btn:hover{filter:brightness(1.06)}
+</style>
+</head>
+<body>
+<header>
+  <div class="brandmark">
+    <div class="nm">Marque<span class="dot">.</span></div>
+    <div class="sub">Auto Company Sim · 1990–2010</div>
+  </div>
+  <div class="clock" id="clock">Q1 · 1990</div>
+  <div class="run-ctl">
+    <button id="newRunBtn">↻ New Run</button>
+    <button id="continueBtn">Continue Run</button>
+  </div>
+  <div class="cluster" id="cluster"></div>
+</header>
+<!-- factory hero — always visible, live readout of sim state -->
+<div class="factory-hero">
+  <canvas id="factoryCanvas"></canvas>
+  <div class="factory-hud">
+    <div class="fhud-stat" id="fhudStat">—</div>
+    <div class="fhud-bar">
+      <span class="flbl">Line</span>
+      <div class="fgrp">
+        <button data-fspd="0.5">0.5×</button>
+        <button data-fspd="1" class="on">1×</button>
+        <button data-fspd="2">2×</button>
+      </div>
+      <div class="fgrp">
+        <button id="fDnBtn">Dusk</button>
+      </div>
+    </div>
+  </div>
+</div>
+<!-- campus builder (PART B): the hero above is the plant interior; this is the
+     plant site you place and tool. Plant capacity feeds the sim each quarter. -->
+<div class="campus">
+  <div class="campus-grid">
+    <div class="campus-title">Plant Campus</div>
+    <canvas id="worldCanvas"></canvas>
+  </div>
+  <div class="campus-side">
+    <div class="campus-panel"><h3>Build</h3><div id="worldMenu"></div></div>
+    <div class="campus-panel"><h3>Inspector</h3><div id="worldInspector"></div></div>
+  </div>
+</div>
+<div id="goalBanner"></div>
+
+<div class="grid">
+  <div class="col-left">
+    <div class="panel">
+      <h2>Lineup · design &amp; price your models</h2>
+      <div id="segments"></div>
+      <div class="hint">Design a car per segment: pick engine + trim, set price, advance each quarter. Engine matters: V8 wins Coupe buyers on performance; I4 wins Sedan on efficiency. Rivals react every quarter. Refresh to reset novelty before it fades.</div>
+    </div>
+  </div>
+  <div class="col-right">
+    <div class="panel">
+      <h2>R&amp;D · plan this quarter</h2>
+      <div id="rd"></div>
+    </div>
+    <div class="panel" id="factoryPanel">
+      <h2>Factory</h2>
+      <div id="factory"></div>
+    </div>
+    <div class="panel">
+      <h2>Overall market share</h2>
+      <svg class="chart" id="chart" viewBox="0 0 320 150" preserveAspectRatio="none"></svg>
+      <div class="leg" id="chartleg"></div>
+    </div>
+    <div class="panel">
+      <h2>Quarterly report</h2>
+      <div class="log" id="log"></div>
+    </div>
+  </div>
+</div>
+
+<div class="advance">
+  <button id="advBtn">Advance Quarter ▸</button>
+</div>
+
+<!-- launch screen overlay — shown on new game, hidden after first car is designed -->
+<div id="launchOverlay"></div>
+<!-- Design Studio overlay — the in-game car-design flow, opened from the studio building -->
+<div id="studioOverlay"></div>
+
+<script>
+/* ── global state ─────────────────────────────────────────────────────────── */
+let st;
+let pendingRD = { eng:50, eff:30, mfg:40 };
+let pendingFactory = false;
+let studioSel = null;   // { segId, engId, trimId } while a design is in progress in the Studio overlay
+let launchSel = { segId:'sedan', engId:'I4', trimId:'mid' };
+let launchObjId = 'share';
+let _lastCash = 0, _lastShare = 0, _lastBrand = 0;
+const SAVE_KEY = 'marque.save.v3';
+
+const { newGame, advance, segShares, playerDesign, playerRefresh, playerRetire,
+        quoteDesign, objectiveStatus, makeObjective, OBJECTIVES, endRecap,
+        SEGS, ENGINES, TRIMS, C } = MarqueSim;
+
+/* ── save / load (A7) ─────────────────────────────────────────────────────── */
+function saveGame(){
+  try {
+    const campus = (typeof MarqueWorld!=='undefined') ? MarqueWorld.getCampus() : null;
+    localStorage.setItem(SAVE_KEY, JSON.stringify({ st, campus }));
+  } catch(e){}
+  refreshRunButtons();
+}
+function hasSave(){ try { return !!localStorage.getItem(SAVE_KEY); } catch(e){ return false; } }
+function loadGame(){
+  try {
+    const raw = localStorage.getItem(SAVE_KEY);
+    if(!raw) return false;
+    const data = JSON.parse(raw);
+    st = data && data.st ? data.st : data;        // tolerate older saves (st only)
+    if(typeof MarqueWorld!=='undefined') MarqueWorld.loadCampus(data && data.campus ? data.campus : null);
+    studioSel = null; pendingFactory = false;
+    applyCampusToSim();
+    _lastCash = st.companies.find(c=>c.player).cash;
+    _lastShare = st.lastOverall*100;
+    _lastBrand = st.companies.find(c=>c.player).brand*100;
+    MarqueFactory.update(st, { hasRecall:false });
+    render();
+    return true;
+  } catch(e){ return false; }
+}
+
+/* ── campus ↔ sim bridge (PART B, the explicit input hook) ─────────────────── */
+function applyCampusToSim(){
+  if(typeof MarqueWorld==='undefined' || !st) return;
+  const inputs = MarqueWorld.deriveCampusInputs(MarqueWorld.getCampus());
+  st.companies.find(c=>c.player).factory.capacity = inputs.capacity;
+}
+// campus → design gating. The world reports studio presence/level; the shell reads
+// it to decide whether in-game design/redesign is allowed (and how cheap refreshes are).
+function studioInfo(){
+  if(typeof MarqueWorld==='undefined') return { present:false, level:0 };
+  return MarqueWorld.deriveCampusInputs(MarqueWorld.getCampus()).designStudio;
+}
+function hasStudio(){ return studioInfo().present; }
+function studioLevel(){ return studioInfo().level; }
+function initCampus(){
+  MarqueWorld.init(document.getElementById('worldCanvas'), {
+    menuEl: document.getElementById('worldMenu'),
+    inspectorEl: document.getElementById('worldInspector'),
+    getCash: () => st ? st.companies.find(c=>c.player).cash : 0,
+    onSpend: (amt) => { if(st) st.companies.find(c=>c.player).cash -= amt; },
+    onChange: () => { applyCampusToSim(); render(); saveGame(); },
+    // focus the factory interior on the selected plant's output (null = whole company)
+    onSelect: (obj) => { if(typeof MarqueFactory!=='undefined') MarqueFactory.setFocus(obj ? obj.lastOutput : null); },
+    // a Design Studio is the home of the car-design flow (click it, or its inspector button)
+    onStudioOpen: () => openStudio(studioSel ? studioSel.segId : null),
+    getStudioStatus: () => studioSel ? ('Designing ' + (SEGS.find(s=>s.id===studioSel.segId)?.name||'')) : 'Idle',
+  });
+}
+// arm the Design Studio build tool and bring the campus into view (the one-click
+// path offered by the locked state in segment cards)
+function armStudioBuild(){
+  if(typeof MarqueWorld!=='undefined') MarqueWorld.toggleBuild('studio');
+  const c = document.querySelector('.campus');
+  if(c) c.scrollIntoView({ behavior:'smooth', block:'center' });
+}
+function refreshRunButtons(){
+  const cont = document.getElementById('continueBtn');
+  if(cont) cont.disabled = !hasSave();
+}
+
+/* ── formatting ─────────────────────────────────────────────────────────── */
+function fmtM(v){
+  const a=Math.abs(v);
+  return a>=1000 ? (v/1000).toFixed(2).replace(/\.?0+$/,'')+'B' : Math.round(v)+'M';
+}
+function deltaHtml(now, prev, money){
+  const d=now-prev; if(Math.abs(d)<0.01) return `<span class="dim">—</span>`;
+  const cls=d>0?'up':'down', ar=d>0?'▲':'▼';
+  const txt=money?'$'+fmtM(Math.abs(d)):Math.abs(d).toFixed(1);
+  return `<span class="${cls}">${ar} ${txt}</span>`;
+}
+function carSVG(hex){
+  return `<svg viewBox="0 0 40 20" fill="${hex}"><path d="M2 14 Q3 9 9 8 L13 4 Q15 2 20 2 L27 2 Q31 2 33 6 L37 8 Q39 9 38 13 L38 15 Q38 16 36 16 L4 16 Q2 16 2 14 Z"/><circle cx="11" cy="16" r="3" fill="#15171C"/><circle cx="30" cy="16" r="3" fill="#15171C"/></svg>`;
+}
+function engHP(e){ return Math.round(120 + e.perf * 400); }
+function engFuel(e){
+  if(e.name==='EV') return '~110 MPGe';
+  return Math.round(17 + e.eff * 22) + ' mpg';
+}
+
+/* ── launch screen ─────────────────────────────────────────────────────── */
+function renderLaunchScreen(){
+  const ov = document.getElementById('launchOverlay');
+  ov.style.display = 'flex';
+
+  const s = SEGS.find(sg => sg.id === launchSel.segId);
+  const validEngs = Object.entries(ENGINES)
+    .filter(([id,e]) => e.fits.includes(launchSel.segId) && C.startYear >= e.unlock);
+
+  // ensure selected engine is valid for current bodystyle
+  if(!validEngs.find(([id]) => id === launchSel.engId)) {
+    launchSel.engId = validEngs[0][0];
+  }
+
+  const eng  = ENGINES[launchSel.engId];
+  const trim = TRIMS[launchSel.trimId];
+  const estCost   = +(s.baseCost + eng.costAdd + trim.costAdd).toFixed(1);
+  const defPrice  = +(s.refPrice + eng.costAdd*0.55 + trim.priceAdd).toFixed(1);
+  const floorPr   = +(estCost * 1.02).toFixed(1);
+  const ceilPr    = +(s.refPrice * 1.65).toFixed(1);
+  const designCost = quoteDesign(st, launchSel.segId, launchSel.engId, launchSel.trimId).designCost;
+
+  ov.innerHTML = `<div class="launch-card">
+    <div class="launch-title">Found your automaker · 1990</div>
+    <div class="launch-sub">Pick a victory goal, then design your first car</div>
+
+    <div class="lnch-sec">
+      <div class="lnch-sec-lbl">Victory goal</div>
+      <div class="lnch-opts">
+        ${Object.values(OBJECTIVES).map(o=>`<button class="lnch-btn eng-card${launchObjId===o.id?' sel':''}"
+          style="flex:1 1 46%;min-width:200px"
+          onclick="setLaunchObj('${o.id}')">
+          <span class="en" style="font-size:12px">${o.name}</span>
+          <span class="ec">${o.blurb}</span>
+        </button>`).join('')}
+      </div>
+    </div>
+
+    <div class="lnch-sec">
+      <div class="lnch-sec-lbl">Bodystyle (your founding segment — no tooling fee)</div>
+      <div class="lnch-opts">
+        ${SEGS.map(sg=>`<button class="lnch-btn${launchSel.segId===sg.id?' sel':''}"
+          onclick="setLaunchSel('${sg.id}',null,null)">${sg.name}</button>`).join('')}
+      </div>
+    </div>
+
+    <div class="lnch-sec">
+      <div class="lnch-sec-lbl">Engine</div>
+      <div class="lnch-opts">
+        ${validEngs.map(([id,e])=>`<button class="lnch-btn eng-card${launchSel.engId===id?' sel':''}"
+          onclick="setLaunchSel(null,'${id}',null)">
+          <span class="en">${e.name}</span>
+          <span class="ec">~${engHP(e)} hp · ${engFuel(e)}${e.costAdd>0?' · +$'+e.costAdd+'k/unit':''}</span>
+        </button>`).join('')}
+      </div>
+    </div>
+
+    <div class="lnch-sec">
+      <div class="lnch-sec-lbl">Trim</div>
+      <div class="lnch-opts">
+        ${Object.entries(TRIMS).map(([id,t])=>`<button class="lnch-btn${launchSel.trimId===id?' sel':''}"
+          onclick="setLaunchSel(null,null,'${id}')">${t.name}${t.featAdd>0?' · +features':''}</button>`).join('')}
+      </div>
+    </div>
+
+    <div class="lnch-sec">
+      <div class="lnch-sec-lbl">Launch price</div>
+      <div class="lnch-price-row">
+        <span class="lnch-price-k">Your price</span>
+        <span class="lnch-price-v" id="lnchPv">$${defPrice.toFixed(1)}k</span>
+      </div>
+      <input type="range" id="lnchPr" min="${floorPr}" max="${ceilPr}" step="0.1" value="${defPrice}"
+        oninput="document.getElementById('lnchPv').textContent='$'+parseFloat(this.value).toFixed(1)+'k'">
+      <div class="lnch-cost-note">Unit cost $${estCost}k · Design cost $${designCost}M of your $${Math.round(st.companies[0].cash)}M cash</div>
+    </div>
+
+    <button class="lnch-launch-btn" onclick="confirmLaunch()">Launch ▸</button>
+  </div>`;
+}
+
+function setLaunchSel(segId, engId, trimId){
+  if(segId !== null){
+    launchSel.segId = segId;
+    // reset engine to first valid for new bodystyle if current doesn't fit
+    const valid = Object.keys(ENGINES).filter(id => ENGINES[id].fits.includes(segId) && C.startYear >= ENGINES[id].unlock);
+    if(!valid.includes(launchSel.engId)) launchSel.engId = valid[0] || 'I4';
+  }
+  if(engId  !== null) launchSel.engId  = engId;
+  if(trimId !== null) launchSel.trimId = trimId;
+  renderLaunchScreen();
+}
+
+function setLaunchObj(id){
+  launchObjId = id;
+  st.objective = makeObjective(id);
+  renderLaunchScreen();
+}
+
+function confirmLaunch(){
+  const pr = document.getElementById('lnchPr');
+  const price = pr ? parseFloat(pr.value) : null;
+  st.objective = makeObjective(launchObjId);
+  const result = playerDesign(st, launchSel.segId, launchSel.engId, launchSel.trimId, price);
+  if(!result.ok){
+    // shouldn't happen at launch (player always has enough cash) but guard
+    alert(result.reason); return;
+  }
+  st.launchFlow = false;
+  document.getElementById('launchOverlay').style.display = 'none';
+  MarqueFactory.update(st, { hasRecall: false });
+  render();
+  saveGame();
+}
+
+/* ── render ─────────────────────────────────────────────────────────────── */
+function render(){
+  if(st.launchFlow){ renderLaunchScreen(); return; }
+
+  const player = st.companies.find(c=>c.player);
+  document.getElementById('clock').innerHTML = `Q<b>${st.quarter}</b> · ${st.year}`;
+  document.title = `MARQUE · Q${st.quarter} ${st.year}`;
+
+  const ov = st.lastOverall*100;
+  const showDelta = st.tick > 0;
+  const dash = '<span class="dim">—</span>';
+  document.getElementById('cluster').innerHTML = `
+    <div class="gauge"><div class="lbl">Cash</div>
+      <div class="val">$${fmtM(player.cash)}</div>
+      <div class="delta">${showDelta ? deltaHtml(player.cash,_lastCash,true) : dash}</div></div>
+    <div class="gauge"><div class="lbl">Market Share</div>
+      <div class="val">${ov.toFixed(1)}<small style="font-size:13px;color:var(--dim)">%</small></div>
+      <div class="delta">${showDelta ? deltaHtml(ov,_lastShare,false) : dash}</div></div>
+    <div class="gauge"><div class="lbl">Brand</div>
+      <div class="val">${Math.round(player.brand*100)}</div>
+      <div class="delta">${showDelta ? deltaHtml(player.brand*100,_lastBrand,false) : dash}</div></div>
+    <div class="gauge"><div class="lbl">Last Q Profit</div>
+      <div class="val ${st.lastProfit>=0?'up':'down'}">${st.lastProfit>=0?'+':'-'}$${fmtM(Math.abs(st.lastProfit))}</div>
+      <div class="delta" style="color:var(--dimmer);font-size:10px;font-family:var(--mono)">net of R&amp;D + overhead</div></div>`;
+  _lastCash=player.cash; _lastShare=ov; _lastBrand=player.brand*100;
+
+  renderGoalBanner();
+  renderSegments();
+  renderRD();
+  renderFactory();
+  renderChart();
+  renderLog();
+
+  const advWrap = document.querySelector('.advance');
+  if(st.over){
+    advWrap.innerHTML = renderEndScreen();
+  } else {
+    advWrap.innerHTML = `<button id="advBtn" onclick="doAdvance()">Advance Quarter ▸</button>`;
+  }
+  if(typeof MarqueWorld!=='undefined') MarqueWorld.renderPanels();
+}
+
+/* ── segment cards ─────────────────────────────────────────────────────── */
+function renderSegments(){
+  const player = st.companies.find(c=>c.player);
+  const wrap = document.getElementById('segments');
+  wrap.innerHTML = '';
+
+  SEGS.forEach(s => {
+    const pm = player.models.find(m=>m.segId===s.id&&m.active);
+    const shares = segShares(s.id, st);
+    const studioHere = hasStudio();
+
+    const div = document.createElement('div');
+    div.className = 'seg';
+    let html = `<div class="seg-head">
+      <div class="seg-name">${s.name}</div>
+      <div class="seg-meta">${s.demand}k units/q · ref $${s.refPrice}k</div>
+    </div>`;
+
+    /* current model block */
+    if(pm){
+      const sh = shares['you'];
+      const shPct = sh ? Math.round(sh.share*100) : 0;
+      const margin = (pm.price - pm.cost).toFixed(1);
+      const nov = Math.round(pm.novelty*100);
+      const novColor = nov>60?'var(--green)':nov>35?'var(--amber)':'var(--red)';
+      const floorPrice = +(pm.cost*1.02).toFixed(1);
+      const ceilPrice  = +(s.refPrice*1.65).toFixed(1);
+      const isHalo = pm.segId==='coupe' && (pm.engId==='V8'||pm.engId==='V12');
+      html += `<div class="model-row">
+        <div class="model-badge">
+          <div class="eng">${ENGINES[pm.engId].name}</div>
+          <div class="trm">${TRIMS[pm.trimId].name} · $${pm.cost}k/unit</div>
+          <div class="nov-bar"><i style="width:${nov}%;background:${novColor}"></i></div>
+          <div class="nov-lbl">Novelty ${nov}%</div>
+          ${pm.recallQ>0?`<span class="recall-badge">⚠ Recall (${pm.recallQ}q)</span>`:''}
+          ${isHalo?`<div class="halo-badge">★ Halo · +brand/q</div>`:''}
+        </div>
+        <div class="price-ctl">
+          <div class="price-row"><span class="k">Your price</span>
+            <span class="v" id="pv-${s.id}">$${pm.price.toFixed(1)}k</span></div>
+          <input type="range" id="pr-${s.id}"
+            min="${floorPrice}" max="${ceilPrice}" step="0.1" value="${pm.price}">
+          <div class="share-proj" id="sp-${s.id}">
+            Proj. share <b>${shPct}%</b> · margin $${margin}k/car
+          </div>
+        </div>
+      </div>`;
+
+      /* car icons row */
+      const myE = shares['you'];
+      const units = myE ? Math.round(s.demand * myE.share) : 0;
+      const nCars = Math.min(Math.round(units/8), 16);
+      let carsHtml = '';
+      for(let i=0;i<nCars;i++) carsHtml += carSVG('#F2A33C');
+      html += `<div class="cars" id="cars-${s.id}">${carsHtml}<span class="units">${units>0?units+'k units':''}</span></div>`;
+
+      const refreshCost = refreshCostFor(s);
+      const redesignBtn = studioHere
+        ? `<button class="btn" onclick="openStudio('${s.id}')">Redesign in Studio ▸</button>`
+        : `<button class="btn locked" onclick="armStudioBuild()" title="Build a Design Studio to redesign">🔒 Build a Studio to redesign</button>`;
+      html += `<div class="seg-actions">
+        ${redesignBtn}
+        <button class="btn" onclick="doRefresh('${s.id}')" ${player.cash<refreshCost?'disabled':''}>
+          Refresh $${refreshCost}M</button>
+        <button class="btn danger" onclick="doRetire('${s.id}')">Retire</button>
+      </div>`;
+    } else {
+      const isNewSeg = !(player.launchedSegs && player.launchedSegs[s.id]);
+      const toolNote = isNewSeg
+        ? `<span style="color:var(--red)">Entering ${s.name} needs <b>$${C.segmentLaunchCost}M</b> in plant tooling, on top of the design.</span>`
+        : `You've tooled ${s.name} before — re-entry is just the design cost.`;
+      if(studioHere){
+        html += `<div class="no-model">No model in this segment. ${toolNote}</div>`;
+        html += `<div class="seg-actions">
+          <button class="btn primary" onclick="openStudio('${s.id}')">Develop in Studio ▸</button>
+        </div>`;
+      } else {
+        html += `<div class="no-model locked">No model yet. <b>Build a Design Studio</b> to develop new models. ${toolNote}</div>`;
+        html += `<div class="seg-actions">
+          <button class="btn primary" onclick="armStudioBuild()">+ Build a Design Studio</button>
+        </div>`;
+      }
+    }
+
+    /* competitor share bar */
+    const ordered = [...st.companies].sort((a,b)=>a.player?-1:b.player?1:0);
+    html += `<div class="sharebar" id="sharebar-${s.id}">
+      ${ordered.map(co=>{
+        const e=shares[co.id]; const pct=e?(e.share*100).toFixed(1):'0';
+        return `<span style="width:${pct}%;background:${co.hex}" title="${co.name} ${pct}%"></span>`;
+      }).join('')}
+    </div>
+    <div class="leg" id="leg-${s.id}">
+      ${ordered.map(co=>{
+        const e=shares[co.id]; const pct=e?Math.round(e.share*100):0;
+        const m=co.models.find(m=>m.segId===s.id&&m.active);
+        return `<span class="it"><span class="sw" style="background:${co.hex}"></span>${co.name} ${pct}%${m&&!co.player?' ('+ENGINES[m.engId].name+')':''}</span>`;
+      }).join('')}
+    </div>`;
+
+    div.innerHTML = html;
+    wrap.appendChild(div);
+
+    /* bind price slider — syncs projection text, sharebar, legend, car icons */
+    const slider = div.querySelector(`#pr-${s.id}`);
+    if(slider){
+      slider.addEventListener('change', saveGame);
+      slider.addEventListener('input', e => {
+        if(!pm) return;
+        pm.price = parseFloat(e.target.value);
+        document.getElementById(`pv-${s.id}`).textContent = `$${pm.price.toFixed(1)}k`;
+
+        // update share projection text for all segments (price in one seg doesn't affect others,
+        // but this keeps deltas consistent if player has multiple sliders open)
+        SEGS.forEach(ss => {
+          const el = document.getElementById(`sp-${ss.id}`); if(!el) return;
+          const sh2 = segShares(ss.id, st)['you'];
+          const mm  = player.models.find(m=>m.segId===ss.id&&m.active);
+          if(!mm) return;
+          el.innerHTML = `Proj. share <b>${sh2?Math.round(sh2.share*100):0}%</b> · margin $${(mm.price-mm.cost).toFixed(1)}k/car`;
+        });
+
+        // sync this segment's sharebar, legend, and car icons in lockstep
+        const sharesNow = segShares(s.id, st);
+        const ord2 = [...st.companies].sort((a,b)=>a.player?-1:b.player?1:0);
+
+        const sbEl = document.getElementById(`sharebar-${s.id}`);
+        if(sbEl) sbEl.innerHTML = ord2.map(co=>{
+          const en=sharesNow[co.id]; const pct=en?(en.share*100).toFixed(1):'0';
+          return `<span style="width:${pct}%;background:${co.hex}" title="${co.name} ${pct}%"></span>`;
+        }).join('');
+
+        const legEl = document.getElementById(`leg-${s.id}`);
+        if(legEl) legEl.innerHTML = ord2.map(co=>{
+          const en=sharesNow[co.id]; const pct=en?Math.round(en.share*100):0;
+          const m2=co.models.find(m=>m.segId===s.id&&m.active);
+          return `<span class="it"><span class="sw" style="background:${co.hex}"></span>${co.name} ${pct}%${m2&&!co.player?' ('+ENGINES[m2.engId].name+')':''}</span>`;
+        }).join('');
+
+        const carsEl = document.getElementById(`cars-${s.id}`);
+        if(carsEl){
+          const myE = sharesNow['you'];
+          const u = myE ? Math.round(s.demand * myE.share) : 0;
+          const nc = Math.min(Math.round(u/8), 16);
+          let ch = '';
+          for(let i=0;i<nc;i++) ch += carSVG('#F2A33C');
+          carsEl.innerHTML = ch + `<span class="units">${u>0?u+'k units':''}</span>`;
+        }
+      });
+    }
+  });
+}
+
+/* ── R&D ──────────────────────────────────────────────────────────────── */
+function renderRD(){
+  const player = st.companies.find(c=>c.player);
+  const branches = [
+    { k:'eng', name:'Powertrain',
+      sub:'performance + quality · reduces recall risk',
+      pct: () => (1-Math.exp(-player.rd.eng/C.rdEffort)),
+      effect: () => {
+        const prog = 1-Math.exp(-player.rd.eng/C.rdEffort);
+        const q = Math.round((0.50 + C.qualityCap*prog)*100);
+        return `Quality ${q}% · recall risk ↓ with quality`;
+      }
+    },
+    { k:'eff', name:'Reliability',
+      sub:'fuel economy and range across all models',
+      pct: () => (1-Math.exp(-player.rd.eff/C.rdEffort)),
+      effect: () => {
+        const prog = 1-Math.exp(-player.rd.eff/C.rdEffort);
+        const bonus = Math.round(C.effBonusCap*prog*100);
+        return `Efficiency bonus +${bonus}%`;
+      }
+    },
+    { k:'mfg', name:'Manufacturing',
+      sub:'lowers unit production cost per car',
+      pct: () => (1-Math.exp(-player.rd.mfg/C.rdEffort)),
+      effect: () => {
+        const prog = 1-Math.exp(-player.rd.mfg/C.rdEffort);
+        const cut = Math.round(C.mfgCostCut*prog*100);
+        return `Cost reduction ${cut}%`;
+      }
+    },
+  ];
+  const wrap = document.getElementById('rd'); wrap.innerHTML = '';
+  branches.forEach(b => {
+    const div = document.createElement('div'); div.className = 'rd';
+    const pct = Math.round(b.pct()*100);
+    div.innerHTML = `
+      <div class="row">
+        <span class="k">${b.name}<small>${b.sub}</small></span>
+        <span class="v" id="rdv-${b.k}">$${pendingRD[b.k]}M</span>
+      </div>
+      <input type="range" id="rds-${b.k}" min="0" max="130" step="5" value="${pendingRD[b.k]}">
+      <div class="statbar"><i style="width:${pct}%"></i></div>
+      <div class="rd-effect">${b.effect()}</div>`;
+    wrap.appendChild(div);
+    div.querySelector(`#rds-${b.k}`).addEventListener('input', e => {
+      pendingRD[b.k] = parseInt(e.target.value);
+      document.getElementById(`rdv-${b.k}`).textContent = `$${pendingRD[b.k]}M`;
+      const el = document.getElementById('rdtot');
+      if(el) el.textContent = `$${pendingRD.eng+pendingRD.eff+pendingRD.mfg}M`;
+    });
+  });
+  const tot = document.createElement('div'); tot.className = 'rd-total';
+  tot.innerHTML = `<span class="dim">Total this quarter</span><b id="rdtot">$${pendingRD.eng+pendingRD.eff+pendingRD.mfg}M</b>`;
+  wrap.appendChild(tot);
+}
+
+/* ── factory ─────────────────────────────────────────────────────────── */
+function renderFactory(){
+  const player = st.companies.find(c=>c.player);
+  const cap = player.factory.capacity;
+  const projDemand = SEGS.reduce((sum,s)=>{
+    const sh = segShares(s.id,st)['you']; return sum+(sh?sh.units:0);
+  },0);
+  const util = Math.min(projDemand/cap, 1);
+  const bottleneck = projDemand > cap*0.92;
+  const barColor = bottleneck ? 'var(--red)' : 'var(--amber)';
+  const canUpgrade = player.cash >= C.capacityUpgradeCost;
+  const activeCount = player.models.filter(m=>m.active).length;
+  const plantCarry  = Math.round(C.capacityCarry*cap);
+  const overhead    = Math.round(C.overheadBase + C.overheadPerModel*activeCount + plantCarry);
+  document.getElementById('factory').innerHTML = `
+    <div class="factory-row">
+      <div class="factory-stat">Capacity: <b>${cap}k</b>/q</div>
+      <div class="cap-bar"><i style="width:${Math.round(util*100)}%;background:${barColor}"></i></div>
+      <div class="factory-stat" style="color:${bottleneck?'var(--red)':'var(--dim)'}">
+        <b>${Math.round(projDemand)}k</b> proj.
+      </div>
+    </div>
+    <div class="factory-stat" style="margin-bottom:10px;font-size:11px">
+      Overhead <b>$${overhead}M</b>/q &nbsp;<span class="dim">= base $${C.overheadBase} + ${activeCount} model${activeCount!==1?'s':''} ($${C.overheadPerModel} ea) + plant $${plantCarry}</span>
+      ${bottleneck?`<span style="color:var(--red)"> · capacity is throttling your sales</span>`:''}
+    </div>
+    <div class="factory-stat" style="font-size:11px;color:var(--dim)">
+      Capacity is set by your <b style="color:var(--hi)">Plant Campus</b> above — build or upgrade an Assembly Plant to expand it.
+    </div>`;
+  // sync factory hero HUD stat line
+  const fhudEl = document.getElementById('fhudStat');
+  if(fhudEl){
+    const activeModels = player.models.filter(m => m.active);
+    const lastModel = activeModels[activeModels.length - 1];
+    const building = lastModel
+      ? `${ENGINES[lastModel.engId].name} ${SEGS.find(s=>s.id===lastModel.segId)?.name}`
+      : '—';
+    fhudEl.innerHTML = `${cap}k cap &nbsp;·&nbsp; <span style="${bottleneck?'color:var(--red)':''}">${Math.round(projDemand)}k proj</span> &nbsp;·&nbsp; Building: <b>${building}</b>`;
+  }
+}
+
+/* ── chart ────────────────────────────────────────────────────────────── */
+function renderChart(){
+  const svg = document.getElementById('chart');
+  const W=320,H=150,pad=4,n=st.history.length;
+  if(n<1){svg.innerHTML='';return;}
+  let out='';
+  [.25,.5,.75].forEach(g=>{
+    const y=(pad+(1-g)*(H-2*pad)).toFixed(1);
+    out+=`<line x1="0" y1="${y}" x2="${W}" y2="${y}" stroke="var(--line)" stroke-width="0.7"/>`;
+  });
+  st.companies.forEach(c=>{
+    const pts = st.history.map((p,i)=>{
+      const x = n===1?W/2:pad+(i/(n-1))*(W-2*pad);
+      const y = pad+(1-(p[c.id]||0))*(H-2*pad);
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(' ');
+    out+=`<polyline points="${pts}" fill="none" stroke="${c.hex}"
+      stroke-width="${c.player?2.4:1.4}" stroke-linejoin="round" stroke-linecap="round"
+      opacity="${c.player?1:.8}"/>`;
+    const last=st.history[n-1];
+    const lx=(n===1?W/2:W-pad).toFixed(1);
+    const ly=(pad+(1-(last[c.id]||0))*(H-2*pad)).toFixed(1);
+    out+=`<circle cx="${lx}" cy="${ly}" r="${c.player?3:2}" fill="${c.hex}"/>`;
+  });
+  svg.innerHTML=out;
+  document.getElementById('chartleg').innerHTML=st.companies.map(c=>
+    `<span class="it"><span class="sw" style="background:${c.hex}"></span>${c.name} ${Math.round((c.lastShareOverall||0)*100)}%</span>`
+  ).join('');
+}
+
+/* ── log ─────────────────────────────────────────────────────────────── */
+function renderLog(){
+  document.getElementById('log').innerHTML = st.log.map(e=>
+    `<div class="e"><span class="q">${e.label}</span>${e.html}</div>`
+  ).join('');
+}
+
+/* ── Design Studio overlay — the home of in-game design/redesign ─────────── */
+// Gated on a built Design Studio. The founding launch uses its own overlay and is
+// never gated; everything after it routes through here, opened from the studio
+// building (click or inspector) or from the segment-card pointers.
+function defaultDesignFor(segId){
+  const player = st.companies.find(c=>c.player);
+  const pm = player.models.find(m=>m.segId===segId&&m.active);
+  const validEngs = Object.keys(ENGINES).filter(id=>ENGINES[id].fits.includes(segId)&&st.year>=ENGINES[id].unlock);
+  return { segId,
+           engId:  pm ? pm.engId  : validEngs[Math.floor(validEngs.length/2)],
+           trimId: pm ? pm.trimId : 'mid' };
+}
+function openStudio(segId){
+  if(!hasStudio()){ armStudioBuild(); return; }   // safety: no studio → route to building one
+  studioSel = segId ? defaultDesignFor(segId) : null;
+  if(typeof MarqueWorld!=='undefined') MarqueWorld.renderPanels();   // refresh inspector status
+  renderStudioOverlay();
+}
+function studioPickSeg(segId){ studioSel = defaultDesignFor(segId); renderStudioOverlay(); }
+function studioSetDesign(engId, trimId){
+  if(!studioSel) return;
+  studioSel.engId = engId; studioSel.trimId = trimId;
+  renderStudioOverlay();
+}
+function studioBackToSegs(){ studioSel = null; renderStudioOverlay(); }
+function closeStudio(){
+  studioSel = null;
+  document.getElementById('studioOverlay').style.display = 'none';
+  if(typeof MarqueWorld!=='undefined') MarqueWorld.renderPanels();
+  render();
+}
+function studioConfirm(){
+  if(!studioSel) return;
+  const result = playerDesign(st, studioSel.segId, studioSel.engId, studioSel.trimId);
+  if(!result.ok){ alert(result.reason); return; }
+  studioSel = null;
+  document.getElementById('studioOverlay').style.display = 'none';
+  if(typeof MarqueWorld!=='undefined') MarqueWorld.renderPanels();
+  render();
+  saveGame();
+}
+
+function renderStudioOverlay(){
+  const ov = document.getElementById('studioOverlay');
+  ov.style.display = 'flex';
+  const player = st.companies.find(c=>c.player);
+  const lvl = studioLevel();
+  const perk = lvl>=2
+    ? `<span style="color:var(--green)">Level 2 · refreshes cost 30% less</span>`
+    : `<span class="dim">Level 1 · upgrade the Studio for cheaper refreshes</span>`;
+
+  // segment chooser — always shown; the picked segment expands the engine/trim/price form
+  const segCards = SEGS.map(sg=>{
+    const m = player.models.find(mm=>mm.segId===sg.id&&mm.active);
+    const sub = m ? `${ENGINES[m.engId].name} · ${TRIMS[m.trimId].name} · redesign`
+                  : (!(player.launchedSegs&&player.launchedSegs[sg.id]) ? `empty · +$${C.segmentLaunchCost}M tooling` : `empty · re-entry`);
+    const sel = studioSel && studioSel.segId===sg.id;
+    return `<button class="lnch-btn eng-card${sel?' sel':''}" style="flex:1 1 46%;min-width:190px"
+      onclick="studioPickSeg('${sg.id}')">
+      <span class="en" style="font-size:13px">${sg.name}${m?'':' <span style="color:var(--amber)">·new</span>'}</span>
+      <span class="ec">${sub}</span>
+    </button>`;
+  }).join('');
+
+  let form = '';
+  if(studioSel){
+    const s = SEGS.find(sg=>sg.id===studioSel.segId);
+    const eng = ENGINES[studioSel.engId];
+    const validEngs = Object.entries(ENGINES).filter(([id,e])=>e.fits.includes(s.id)&&st.year>=e.unlock);
+    if(!validEngs.find(([id])=>id===studioSel.engId)) studioSel.engId = validEngs[0][0];
+    const q         = quoteDesign(st, s.id, studioSel.engId, studioSel.trimId);
+    const estCost   = (s.baseCost + ENGINES[studioSel.engId].costAdd + TRIMS[studioSel.trimId].costAdd).toFixed(1);
+    const estPrice  = (s.refPrice + ENGINES[studioSel.engId].costAdd*0.55 + TRIMS[studioSel.trimId].priceAdd).toFixed(1);
+    const canAfford = player.cash >= q.total;
+    const toolingLine = q.launchCost>0
+      ? ` &middot; <b style="color:var(--red)">+$${q.launchCost}M tooling</b> to enter ${s.name}` : '';
+    form = `
+      <div class="lnch-sec">
+        <div class="lnch-sec-lbl">Engine</div>
+        <div class="lnch-opts">
+          ${validEngs.map(([id,e])=>`<button class="lnch-btn eng-card${studioSel.engId===id?' sel':''}"
+            onclick="studioSetDesign('${id}','${studioSel.trimId}')">
+            <span class="en">${e.name}</span>
+            <span class="ec">~${engHP(e)} hp · ${engFuel(e)}${e.costAdd>0?' · +$'+e.costAdd+'k/unit':''}</span>
+          </button>`).join('')}
+        </div>
+      </div>
+      <div class="lnch-sec">
+        <div class="lnch-sec-lbl">Trim</div>
+        <div class="lnch-opts">
+          ${Object.entries(TRIMS).map(([id,t])=>`<button class="lnch-btn${studioSel.trimId===id?' sel':''}"
+            onclick="studioSetDesign('${studioSel.engId}','${id}')">${t.name}${t.featAdd>0?' · +features':''}</button>`).join('')}
+        </div>
+      </div>
+      <div class="lnch-cost-note">
+        Design cost <b>$${q.designCost}M</b>${toolingLine} · unit cost $${estCost}k · est. price ~$${estPrice}k
+        &nbsp;·&nbsp; of your $${Math.round(player.cash)}M cash
+      </div>
+      <div class="studio-actions">
+        <button class="lnch-launch-btn" onclick="studioConfirm()" ${canAfford?'':'disabled'}>
+          ${player.models.find(m=>m.segId===s.id&&m.active)?'Redesign':'Develop'} ${s.name} · $${q.total}M ▸</button>
+        <button class="btn" onclick="studioBackToSegs()">← Choose another model</button>
+      </div>`;
+  }
+
+  ov.innerHTML = `<div class="launch-card">
+    <div class="launch-title">Design Studio</div>
+    <div class="launch-sub">${perk}</div>
+    <div class="lnch-sec">
+      <div class="lnch-sec-lbl">Which model?</div>
+      <div class="lnch-opts">${segCards}</div>
+    </div>
+    ${form}
+    <div style="text-align:right;margin-top:10px">
+      <button class="btn" onclick="closeStudio()">Close</button>
+    </div>
+  </div>`;
+}
+
+/* ── refresh cost (with Design Studio L2 discount) ──────────────────────── */
+function refreshCostFor(s){
+  const base = Math.round(C.refreshBase * s.refPrice/22);
+  return studioLevel()>=2 ? Math.round(base*0.70) : base;
+}
+function doRefresh(segId){
+  const s = SEGS.find(x=>x.id===segId);
+  const result = playerRefresh(st, segId);   // sim deducts the full base cost
+  if(!result.ok){ alert(result.reason); return; }
+  // Design Studio L2 perk: refund the discount shell-side (sim stays untouched)
+  if(studioLevel()>=2){
+    const credit = result.cost - refreshCostFor(s);
+    if(credit>0) st.companies.find(c=>c.player).cash += credit;
+  }
+  render();
+  saveGame();
+}
+function doRetire(segId){
+  if(!confirm('Retire this model? You will have no presence in this segment.')) return;
+  playerRetire(st, segId);
+  render();
+  saveGame();
+}
+function doAdvance(){
+  applyCampusToSim();   // input hook: campus-derived capacity feeds the sim
+  advance(st, { rd:{...pendingRD}, factoryUpgrade:false });
+  studioSel=null;
+  // detect recall (recallQ === recallDuration means it just fired this quarter)
+  const player = st.companies.find(c=>c.player);
+  const hasRecall = player.models.some(m => m.active && m.recallQ === C.recallDuration);
+  MarqueFactory.update(st, { hasRecall });
+  if(typeof MarqueWorld!=='undefined'){
+    MarqueWorld.applyProduction(MarqueWorld.getCampus(), st.lastUnits);  // plant utilization readout
+    MarqueWorld.renderPanels();
+  }
+  render();
+  saveGame();
+}
+function renderGoalBanner(){
+  const obj = st.objective;
+  const stat = objectiveStatus(st);
+  const deadline = (obj.deadlineYear - C.startYear)*4 + obj.deadlineQuarter;
+  const current  = (st.year - C.startYear)*4 + st.quarter;
+  const qleft = Math.max(0, deadline - current);
+  const color = stat.met ? 'var(--green)' : (qleft <= 4 ? 'var(--red)' : 'var(--amber)');
+  document.getElementById('goalBanner').innerHTML =
+    `Goal — <b style="color:var(--hi)">${stat.name}</b> by Q${obj.deadlineQuarter}&nbsp;${obj.deadlineYear}`
+    + ` &nbsp;·&nbsp; <span style="color:${color}">${stat.detail}</span>`
+    + ` &nbsp;·&nbsp; ${qleft} quarter${qleft!==1?'s':''} left`;
+}
+
+function renderEndScreen(){
+  const player = st.companies.find(c=>c.player);
+  const obj = st.objective;
+  const reason = st.overReason;
+  const cls = reason==='win'?'win':reason==='bankrupt'?'bankrupt':'timeout';
+  const objName = (OBJECTIVES[obj.id]||OBJECTIVES.share).name;
+  const headline = reason==='win' ? 'Goal achieved.' : reason==='bankrupt' ? 'Insolvent.' : 'Time\'s up.';
+  const sub = reason==='win'
+    ? `You completed ${objName} by Q${st.quarter} ${st.year}.`
+    : reason==='bankrupt'
+    ? `Cash hit zero in Q${st.quarter} ${st.year}. The board wound the company down.`
+    : `Deadline reached without completing ${objName}.`;
+  const headColor = reason==='win'?'var(--green)':reason==='bankrupt'?'var(--red)':'var(--dim)';
+  const keepBtn = st.won ? `<button onclick="keepBuilding()">Keep building →</button>` : '';
+  const recap = endRecap(st);
+  const bestSellerVal = recap.bestSeller
+    ? `${recap.bestSeller.label} <small style="color:var(--dim)">${(recap.bestSeller.units/1000).toFixed(2)}M</small>` : '—';
+  return `<div class="endcard ${cls}">
+    <h3 style="color:${headColor}">${headline}</h3>
+    <div class="sub">${sub}</div>
+    <div class="endstory">“${recap.story}”</div>
+    <div class="score-val">${st.score.toLocaleString()}<small>score</small></div>
+    <div class="stat-grid">
+      <div><div class="sk">Final share</div><div class="sv">${(st.lastOverall*100).toFixed(1)}%</div></div>
+      <div><div class="sk">Peak share</div><div class="sv">${(st.peakShare*100).toFixed(1)}%</div></div>
+      <div><div class="sk">Cash</div><div class="sv">$${fmtM(player.cash)}</div></div>
+      <div><div class="sk">Cars built</div><div class="sv">${(st.totalUnits/1000).toFixed(2)}M</div></div>
+      <div><div class="sk">Brand</div><div class="sv">${Math.round(player.brand*100)}</div></div>
+      <div><div class="sk">Best-seller</div><div class="sv" style="font-size:12px">${bestSellerVal}</div></div>
+    </div>
+    <div class="enddecisive"><span>Decisive factor</span> ${recap.decisive}.</div>
+    <div class="end-actions">
+      <button class="primary-end" onclick="startNew()">Play again</button>
+      ${keepBtn}
+    </div>
+  </div>`;
+}
+
+function keepBuilding(){ st.over = false; render(); saveGame(); }
+
+function startNew(){
+  studioSel=null; pendingFactory=false;
+  pendingRD={eng:50,eff:30,mfg:40};
+  _lastCash=0; _lastShare=0; _lastBrand=0;
+  launchSel={ segId:'sedan', engId:'I4', trimId:'mid' };
+  launchObjId='share';
+  st=newGame();
+  if(typeof MarqueWorld!=='undefined') MarqueWorld.resetCampus();
+  applyCampusToSim();
+  render();
+}
+
+/* boot — resume the saved run if there is one, otherwise start fresh */
+MarqueFactory.init(document.getElementById('factoryCanvas'));
+initCampus();
+if(!loadGame()) startNew();
+refreshRunButtons();
+
+document.getElementById('newRunBtn').onclick = () => {
+  if(st && !st.over && !st.launchFlow &&
+     !confirm('Start a new run? Your current run stays saved until you launch the new one.')) return;
+  startNew();
+};
+document.getElementById('continueBtn').onclick = () => {
+  if(!loadGame()) alert('No saved run found.');
+};
+
+/* factory hero controls */
+let _factNight = false;
+document.querySelectorAll('[data-fspd]').forEach(b => b.onclick = () => {
+  MarqueFactory.setViewSpeed(parseFloat(b.dataset.fspd));
+  document.querySelectorAll('[data-fspd]').forEach(x => x.classList.remove('on'));
+  b.classList.add('on');
+});
+document.getElementById('fDnBtn').onclick = function(){
+  _factNight = !_factNight;
+  MarqueFactory.setNight(_factNight);
+  this.textContent = _factNight ? 'Day' : 'Dusk';
+};
+</script>
+</body>
+</html>
