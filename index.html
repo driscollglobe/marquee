@@ -878,6 +878,7 @@ return { newGame, advance, segShares, playerDesign, playerRefresh, playerRetire,
          quoteDesign, objectiveStatus, objectiveMet, makeObjective, OBJECTIVES, endRecap,
          SEGS, ENGINES, TRIMS, C };
 })();
+
 </script>
 <script>
 /* marque-world.js — MARQUE campus builder (PART B, v2 architecture slice)
@@ -1260,19 +1261,33 @@ function stepAgents(dt){
     if(carSpawnT<=0 && cars.length<maxCars){
       carSpawnT = interval*(0.6+Math.random()*0.8);
       const p = plants[Math.floor(Math.random()*plants.length)];
-      const pd = def(p.type);
-      const cols = fleetColors();
-      cars.push({ type:'car',
-        x:p.x+pd.w*0.5, y:p.y+pd.d*0.5,
-        tx:gatePoint().x, ty:gatePoint().y,
-        color:cols[Math.floor(Math.random()*cols.length)] });
+      const types = fleetTypes();
+      const seg = Math.random()<0.15 ? 'transporter' : types[Math.floor(Math.random()*types.length)];
+      cars.push(makeRolloutCar(p, seg));
     }
   }
+  // cars follow their waypoint path: gate exit → output lane → main road → campus gate
   for(let i=cars.length-1;i>=0;i--){
-    const c=cars[i], dx=c.tx-c.x, dy=c.ty-c.y, dist=Math.hypot(dx,dy);
-    if(dist<0.4){ cars.splice(i,1); continue; }
-    const spd=0.9*speedMul; c.x+=dx/dist*spd*dt; c.y+=dy/dist*spd*dt;
+    const c=cars[i];
+    const wp = c.path ? c.path[c.pi] : {x:c.tx,y:c.ty};
+    if(!wp){ cars.splice(i,1); continue; }
+    const dx=wp.x-c.x, dy=wp.y-c.y, dist=Math.hypot(dx,dy);
+    if(dist<0.35){
+      if(c.path){ c.pi++; if(c.pi>=c.path.length){ cars.splice(i,1); } }
+      else cars.splice(i,1);
+      continue;
+    }
+    const spd=0.95*speedMul; c.x+=dx/dist*spd*dt; c.y+=dy/dist*spd*dt;
   }
+}
+// build a finished vehicle leaving a plant: out the +x gate, along the output lane,
+// onto the main campus road, then toward the campus gate at the edge.
+function makeRolloutCar(p, seg){
+  const pd=def(p.type), mainY=campusLayout().mainY, ex=p.x+pd.w+0.5;
+  const gy=p.y+pd.d*0.5;
+  // emerge from the +x gate mouth (outside the footprint, so cars never sit on the roof)
+  return { type:'car', seg: seg||'sedan', x:p.x+pd.w+0.15, y:gy, pi:0,
+    path:[ {x:ex, y:gy}, {x:ex, y:mainY+0.5}, {x:GRID_W-0.3, y:mainY+0.5} ] };
 }
 
 function drawAgent(a){
@@ -1288,29 +1303,50 @@ function drawAgent(a){
   }
 }
 
-// a small finished car (driving or parked), coloured by bodystyle
-function drawSmallCar(x,y,color){
+// active-model bodystyles (for colouring/typing the finished vehicles); fallback sedan
+function fleetTypes(){
+  const out=[];
+  if(factorySimState){
+    const player=factorySimState.companies&&factorySimState.companies.find(c=>c.player);
+    if(player&&player.models) player.models.filter(m=>m.active).forEach(m=>out.push(m.segId));
+  }
+  return out.length?out:['sedan'];
+}
+// procedural fallback car (used when a vehicle sprite isn't loaded)
+function drawSmallCarProc(x,y,color){
   const p=iso(x,y,0.05); const s=3.4*effSc();
   ctx.fillStyle='rgba(0,0,0,0.28)';
   ctx.beginPath(); ctx.ellipse(p.x,p.y+s*0.5,s*1.25,s*0.55,0,0,Math.PI*2); ctx.fill();
   ctx.fillStyle=color; ctx.fillRect(p.x-s,p.y-s*0.62,s*2,s*1.05);
   ctx.fillStyle='rgba(255,255,255,0.30)'; ctx.fillRect(p.x-s*0.55,p.y-s*0.5,s*1.1,s*0.4);
 }
+// a small readable finished vehicle (driving or parked), by bodystyle → sprite or fallback
+function drawVehicle(x,y,seg){
+  seg = seg || 'sedan';
+  const spr = vehicleSprite(seg);
+  if(!spr){ drawSmallCarProc(x,y, BS_COLORS_WORLD[seg]||'#377BF8'); return; }
+  const p=iso(x,y,0.05), s=effSc();
+  const w=(seg==='transporter'?20:13)*s, h=w*(spr.height/spr.width || 0.55);
+  ctx.fillStyle='rgba(0,0,0,0.20)';
+  ctx.beginPath(); ctx.ellipse(p.x, p.y+2*s, w*0.44, w*0.2, 0, 0, Math.PI*2); ctx.fill();
+  ctx.drawImage(spr, p.x-w/2, p.y-h+3.5*s, w, h);
+}
 
-// finished-goods lot: cars accumulate on the paved apron, count ∝ recent output
+// finished-goods staging lot: vehicles park on the plant's paved lot, count ∝ output
 function drawParkedCars(){
   const act = simActivity();
-  const want = Math.min(Math.round(act.units/12), 26);
+  const want = Math.min(Math.round(act.units/12), 30);
   if(want<=0) return;
-  const dev = developedTiles();
-  const free = [];
-  dev.forEach(k=>{ const [x,y]=k.split(',').map(Number); if(!tileOccupied(x,y)) free.push({x,y}); });
-  free.sort((a,b)=> (a.y-b.y)||(a.x-b.x));
-  const cols = fleetColors();
-  let placed=0;
-  for(const t of free){
-    for(let s=0;s<2 && placed<want;s++){
-      drawSmallCar(t.x+0.32+s*0.4, t.y+0.55, cols[placed % cols.length]);
+  const lay = campusLayout();
+  let cells = lay.staging.slice();
+  if(!cells.length){                      // fallback: any developed, open tile
+    developedTiles().forEach(k=>{ const [x,y]=k.split(',').map(Number); if(!tileOccupied(x,y)) cells.push({x,y}); });
+    cells.sort((a,b)=>(a.y-b.y)||(a.x-b.x));
+  }
+  const types = fleetTypes(); let placed=0;
+  for(const t of cells){
+    for(let k=0;k<2 && placed<want;k++){   // two vehicles per bay, neatly rowed
+      drawVehicle(t.x+0.3+k*0.42, t.y+0.5, types[placed % types.length]);
       placed++;
     }
     if(placed>=want) break;
@@ -1602,6 +1638,64 @@ function developedTiles(){
   return set;
 }
 
+// Visual-only campus infrastructure (roads / plant aprons / staging lots), derived
+// from the building layout. Cached by layout signature. No gameplay — presentation.
+let _layoutCache = { sig:'', data:null };
+function campusLayout(){
+  const sig = campus.objects.map(o=>o.type+o.x+','+o.y+':'+o.level).join('|');
+  if(sig === _layoutCache.sig && _layoutCache.data) return _layoutCache.data;
+  const mainY = Math.round(GRID_D/2);          // main campus road runs along this row → the gate
+  const road = new Set(), apron = new Set(), staging = [];
+  for(let x=0;x<GRID_W;x++) if(!tileOccupied(x,mainY)) road.add(x+','+mainY);
+  campus.objects.forEach(o=>{
+    const d=def(o.type);
+    // service spur: building's centre column down/up to the main road
+    const cx = clamp(Math.round(o.x + d.w/2 - 0.5), 0, GRID_W-1);
+    const ya = Math.min(o.y+d.d, mainY), yb = Math.max(o.y-1, mainY);
+    for(let y=Math.min(ya,mainY); y<=Math.max(yb,mainY); y++)
+      if(y>=0 && y<GRID_D && !tileOccupied(cx,y)) road.add(cx+','+y);
+    if(o.type==='assembly'){
+      // asphalt apron ring around the plant
+      for(let x=o.x-1;x<o.x+d.w+1;x++) for(let y=o.y-1;y<o.y+d.d+1;y++){
+        const inFoot = x>=o.x&&x<o.x+d.w&&y>=o.y&&y<o.y+d.d;
+        if(!inFoot && x>=0&&y>=0&&x<GRID_W&&y<GRID_D) apron.add(x+','+y);
+      }
+      // finished-vehicle staging lot: two rows just in front (+y) of the plant
+      for(let row=1;row<=2;row++){ const yy=o.y+d.d-1+row;
+        for(let sx=o.x; sx<o.x+d.w; sx++)
+          if(sx>=0&&sx<GRID_W&&yy>=0&&yy<GRID_D && !tileOccupied(sx,yy)) staging.push({x:sx,y:yy});
+      }
+    }
+  });
+  _layoutCache = { sig, data:{ mainY, road, apron, staging } };
+  return _layoutCache.data;
+}
+// fill a tile with a flat colour (asphalt/road), matching the iso grid
+function asphaltTile(x,y,fill,stroke){ tile(x,y,fill,stroke||'rgba(30,40,52,.14)'); }
+// draw the road/apron/staging surfaces (visual-only) — called from the ground pass
+function drawInfrastructure(){
+  const lay = campusLayout(), sc=effSc();
+  // plant aprons (asphalt)
+  lay.apron.forEach(k=>{ const [x,y]=k.split(',').map(Number); asphaltTile(x,y,(x+y)%2?'#9AA1A9':'#949BA3'); });
+  // staging lot pad
+  lay.staging.forEach(c=>{ asphaltTile(c.x,c.y,'#7E858E'); });
+  // roads (darker asphalt)
+  lay.road.forEach(k=>{ const [x,y]=k.split(',').map(Number); asphaltTile(x,y,(x+y)%2?'#6E7681':'#69707B'); });
+  // main-road dashed centre line
+  ctx.save();
+  ctx.strokeStyle='rgba(224,166,60,.8)'; ctx.lineWidth=1.6*sc; ctx.setLineDash([6*sc,6*sc]);
+  const a=iso(0,lay.mainY+0.5,0.02), b=iso(GRID_W,lay.mainY+0.5,0.02);
+  ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+  ctx.setLineDash([]);
+  // staging lot parking stripes (white bay dividers)
+  ctx.strokeStyle='rgba(255,255,255,.5)'; ctx.lineWidth=1*sc;
+  lay.staging.forEach(c=>{
+    for(let g=0;g<=1;g++){ const p0=iso(c.x+g*0.5+0.25,c.y+0.15,0.02), p1=iso(c.x+g*0.5+0.25,c.y+0.85,0.02);
+      ctx.beginPath(); ctx.moveTo(p0.x,p0.y); ctx.lineTo(p1.x,p1.y); ctx.stroke(); }
+  });
+  ctx.restore();
+}
+
 // ── render ───────────────────────────────────────────────────────────────────
 function render(){
   if(!ctx) return;
@@ -1624,6 +1718,9 @@ function render(){
       tile(x,y,raw,'rgba(40,52,66,.06)');
     }
   }
+
+  // roads, plant aprons + staging lots on top of the base ground (visual-only)
+  drawInfrastructure();
 
   // build/move ghost footprint highlight (under buildings)
   const _gt = ghostType(), _gd = _gt ? def(_gt) : null;
@@ -1678,7 +1775,7 @@ function render(){
   for(const it of drawList){
     if(it.kind==='b'){ drawBuilding(it.o); drawBuildingAnimated(it.o); }
     else if(it.kind==='a'){ drawAgent(it.a); }
-    else { drawSmallCar(it.c.x, it.c.y, it.c.color); }
+    else { drawVehicle(it.c.x, it.c.y, it.c.seg); }
   }
 
   // first-run coach — bobbing chevron ABOVE the target building (the ground halo is
@@ -1734,6 +1831,23 @@ function preloadAssets(){ Object.keys(ASSET_MANIFEST).forEach(loadAsset); }
 function buildingSprite(o){
   const key = assetKeyFor(o); const rec = _assets[key];
   if(!rec){ if(ASSET_MANIFEST[key]) loadAsset(key); return null; }
+  return rec.state==='ready' ? rec.img : null;
+}
+
+// ── vehicle sprites (finished cars) with procedural fallback ──────────────────
+const VEH_BASE = 'assets/vehicles/';
+const VEH_MANIFEST = { sedan:'sedan.svg', suv:'suv.svg', pickup:'pickup.svg', coupe:'coupe.svg', transporter:'transporter.svg' };
+const _veh = {};
+function loadVeh(k){
+  if(_veh[k] || !VEH_MANIFEST[k]) return;
+  const rec = { img:new Image(), state:'loading' }; _veh[k]=rec;
+  rec.img.onload  = ()=>{ rec.state = rec.img.width>0 ? 'ready' : 'missing'; };
+  rec.img.onerror = ()=>{ rec.state = 'missing'; };
+  rec.img.src = VEH_BASE + VEH_MANIFEST[k];
+}
+function preloadVehicles(){ Object.keys(VEH_MANIFEST).forEach(loadVeh); }
+function vehicleSprite(seg){
+  const rec = _veh[seg]; if(!rec){ if(VEH_MANIFEST[seg]) loadVeh(seg); return null; }
   return rec.state==='ready' ? rec.img : null;
 }
 
@@ -2321,12 +2435,11 @@ function flagRollout(segId, big){ pendingRollout = { segId: segId||null, big: !!
 // the visible "it exists!" moment). Presentation only.
 function spawnRolloutCars(segId, n){
   const plants = plantList(); if(!plants.length) return;
-  const color = BS_COLORS_WORLD[segId] || '#377BF8';
-  const gate = gatePoint();
   for(let i=0;i<n;i++){
-    const p = plants[i % plants.length], pd = def(p.type);
-    cars.push({ type:'car', x:p.x+pd.w*0.5, y:p.y+pd.d*0.5,
-      tx:gate.x, ty:gate.y - 0.6 + Math.random()*1.2, color });
+    const p = plants[i % plants.length];
+    // the freshly-launched model leads; a transporter joins the convoy now and then
+    const seg = (i%5===4) ? 'transporter' : (segId || 'sedan');
+    cars.push(makeRolloutCar(p, seg));
   }
 }
 // First-run coach: pulse a ring over the building the tutorial points at (or clear it).
@@ -2348,7 +2461,8 @@ function loop(now){
 
 function init(canvasEl, options){
   opts = options||{};
-  preloadAssets();     // kick off sprite loads; procedural fallback until they arrive
+  preloadAssets();     // kick off building sprite loads; procedural fallback until they arrive
+  preloadVehicles();   // kick off vehicle sprite loads
   if(canvasEl){
     cv=canvasEl; ctx=cv.getContext('2d');
     resize(); fit();
@@ -2403,6 +2517,7 @@ return {
 };
 
 })();
+
 </script>
 <style>
   :root{
@@ -2906,6 +3021,37 @@ return {
     border:1px solid var(--line);border-radius:8px;font-size:10.5px}
   .md-row{display:flex;justify-content:space-between;gap:10px;padding:2px 0;color:var(--dim)}
   .md-row b{color:var(--hi);font-weight:600;text-align:right}
+
+  /* ── clarity pass: goal statement, money summary, price chain ── */
+  .lnch-goal{background:rgba(47,107,224,.07);border:1px solid rgba(47,107,224,.25);border-radius:10px;
+    padding:10px 14px;margin:10px 0 14px;font-family:var(--sans);font-size:12px;line-height:1.55;
+    color:var(--hi);text-align:left}
+  .lnch-goal .lg-win{display:block;margin-top:5px;color:var(--amber);font-weight:700}
+  #mapGoal{position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:6;
+    background:rgba(255,255,255,.92);backdrop-filter:blur(8px);border:1px solid var(--line);
+    border-radius:999px;padding:5px 16px;font-family:var(--sans);font-size:11px;color:var(--dim);
+    box-shadow:0 3px 10px rgba(30,45,70,.08);white-space:nowrap;max-width:94vw;
+    overflow:hidden;text-overflow:ellipsis;pointer-events:none}
+  #mapGoal b{color:var(--hi);font-weight:700}
+  .money-brief{background:rgba(255,255,255,.94);backdrop-filter:blur(8px);border:1px solid var(--line);
+    border-left:3px solid var(--green);border-radius:10px;padding:8px 12px;margin-bottom:6px;
+    font-family:var(--sans);font-size:11px;color:var(--dim);width:340px;max-width:86vw;
+    box-shadow:0 4px 14px rgba(30,45,70,.10);text-align:left}
+  .money-brief.mb-down{border-left-color:var(--red)}
+  .mb-head{font-size:12px;color:var(--hi);margin-bottom:2px}
+  .mb-head b{font-weight:800}
+  .money-brief.mb-up .mb-head b{color:var(--green)}
+  .money-brief.mb-down .mb-head b{color:var(--red)}
+  .mb-line{margin-bottom:4px}
+  .mb-line b{color:var(--hi);font-weight:600}
+  .mb-why{border-top:1px dashed var(--line);padding-top:4px;color:var(--hi)}
+  .price-chain{display:flex;align-items:center;gap:6px;margin-bottom:4px;font-family:var(--sans)}
+  .pc-cell{flex:1;text-align:center;font-size:9px;letter-spacing:.06em;text-transform:uppercase;color:var(--dimmer)}
+  .pc-cell b{display:block;font-size:14px;letter-spacing:0;text-transform:none;color:var(--hi);font-weight:700;margin-top:1px}
+  .pc-cell b.pc-price{color:var(--amber);font-size:16px}
+  .pc-cell b.pc-profit.up{color:var(--green)}
+  .pc-cell b.pc-profit.down{color:var(--red)}
+  .pc-arrow{color:var(--dimmer);font-size:11px}
 </style>
 </head>
 <body>
@@ -2924,6 +3070,8 @@ return {
   <div class="app-main">
     <div class="world-view" id="worldView">
       <canvas id="worldCanvas"></canvas>
+      <!-- always-visible win condition — the goal is never buried in the drawer -->
+      <div id="mapGoal" style="display:none"></div>
       <!-- docked building inspector — light card, top-right, always dismissable -->
       <div class="world-inspector" id="worldInspectorWrap" style="display:none">
         <button class="winsp-close" title="Close (Esc)" onclick="closeInspector()">×</button>
@@ -2954,7 +3102,7 @@ return {
         <div class="dash-panel" id="dashLineup">
           <div class="factory-brief" id="factoryBrief"></div>
           <div id="segments"></div>
-          <div class="hint">Design a car per segment: pick engine + trim, set price, advance each quarter. Engine matters: V8 wins Coupe buyers on performance; I4 wins Sedan on efficiency. Rivals react every quarter. Refresh to reset novelty before it fades.</div>
+          <div class="hint">How you make money: every car sold earns its price minus its build cost; overhead and R&amp;D come out each quarter. More models = more buyers. Engine matters — V8 wins Coupe buyers, I4 wins Sedan. Refresh aging models before buyers drift to fresher rivals.</div>
         </div>
         <div class="dash-panel" id="dashRD" style="display:none"><div id="rd"></div></div>
         <div class="dash-panel" id="dashMarket" style="display:none">
@@ -3394,6 +3542,32 @@ function engFuel(e){
 }
 
 /* ── launch screen ─────────────────────────────────────────────────────── */
+// One plain-words sentence for the current win condition (respects difficulty target).
+function goalPhrase(objId){
+  const tgt = Math.round(((st && st.objective && st.objective.targetShare)
+    || (DIFFICULTY[launchDiff]||{}).shareTarget || 0.33)*100);
+  switch(objId){
+    case 'volume':      return 'sell 7 million cars by the end of 2000';
+    case 'performance': return 'build your brand to 70+ and win 25% of Coupe buyers by 2000';
+    case 'fullline':    return 'sell in all four segments, profitably, with 25% of the market by 2000';
+    case 'tech':        return 'field a Hybrid and an EV and hold 25% of the market by 2005';
+    default:            return `own ${tgt}% of the market by the end of 2000`;
+  }
+}
+// Launch-price causal chain: cost → price → profit per car, live under the slider.
+function lnchChainText(price, cost){
+  const keep = price - cost;
+  return `Each car costs <b>$${cost.toFixed(1)}k</b> to build → sells for <b>$${price.toFixed(1)}k</b>`
+    + ` → you keep <b style="color:var(--green)">$${keep.toFixed(1)}k per car</b>.`
+    + ` Higher price = more per car, but fewer buyers.`;
+}
+function updateLnchPrice(price, cost){
+  const pv = document.getElementById('lnchPv');
+  if(pv) pv.textContent = '$'+price.toFixed(1)+'k';
+  const ch = document.getElementById('lnchChain');
+  if(ch) ch.innerHTML = lnchChainText(price, cost);
+}
+
 function renderLaunchScreen(){
   const ov = document.getElementById('launchOverlay');
   ov.style.display = 'flex';
@@ -3420,6 +3594,13 @@ function renderLaunchScreen(){
   ov.innerHTML = `<div class="launch-card">
     <div class="launch-title">Design your first car · 1990</div>
     <div class="launch-sub">Pick a bodystyle, engine, trim &amp; price — then take on the rivals</div>
+    <div class="lnch-goal">
+      <b>How to play:</b> design cars and sell them for more than they cost to build.
+      Every sale earns you the difference. Take buyers from <b>Velo</b>, <b>Crownmark</b> and <b>Nuvo</b>.
+      <span class="lg-win">${launchSandbox
+        ? 'Sandbox — no win condition. Build at your own pace.'
+        : `Win: ${goalPhrase(launchObjId)}.`}</span>
+    </div>
 
     <div class="lnch-sec">
       <div class="lnch-sec-lbl">Bodystyle</div>
@@ -3455,8 +3636,8 @@ function renderLaunchScreen(){
         <span class="lnch-price-v" id="lnchPv">$${defPrice.toFixed(1)}k</span>
       </div>
       <input type="range" id="lnchPr" min="${floorPr}" max="${ceilPr}" step="0.1" value="${defPrice}"
-        oninput="document.getElementById('lnchPv').textContent='$'+parseFloat(this.value).toFixed(1)+'k'">
-      <div class="lnch-cost-note">Costs $${estCost}k to build each car</div>
+        oninput="updateLnchPrice(parseFloat(this.value), ${estCost})">
+      <div class="lnch-cost-note" id="lnchChain">${lnchChainText(defPrice, estCost)}</div>
     </div>
 
     <button class="lnch-launch-btn" onclick="confirmLaunch()">Launch ▸</button>
@@ -3599,7 +3780,14 @@ function render(){
     const advisorRoute = logHead && logHead.nextRoute;
     const advisorHtml = advisorNext
       ? `<div class="advisor-card${advisorRoute ? ' actionable' : ''}"${advisorRoute ? ` onclick="advisorAction('${advisorRoute}')"` : ''}>${localizeHtml(advisorNext)}</div>` : '';
-    advWrap.innerHTML = `${advisorHtml}<button id="advBtn" onclick="doAdvance()">Advance Quarter ▸</button>`;
+    // plain-English money summary: did I make money last quarter, and why
+    const q = st._qSummary;
+    const moneyHtml = (q && st.tick > 0) ? `<div class="money-brief ${q.profit>=0?'mb-up':'mb-down'}">
+      <div class="mb-head">${q.q} result: <b>${q.profit>=0?'+':'−'}$${fmtM(Math.abs(q.profit))} ${q.profit>=0?'profit':'loss'}</b></div>
+      <div class="mb-line">Sold <b>${q.units}k cars</b>${q.perCar!=null?` · made <b>$${q.perCar}k</b> on each`:''} · paid <b>$${q.fixed}M</b> overhead &amp; R&amp;D</div>
+      <div class="mb-why">${localizeHtml(q.why)}</div>
+    </div>` : '';
+    advWrap.innerHTML = `${moneyHtml}${advisorHtml}<button id="advBtn" onclick="doAdvance()">Advance Quarter ▸</button>`;
   }
   if(typeof MarqueWorld!=='undefined') MarqueWorld.renderPanels();
   renderBroadcast();
@@ -3625,6 +3813,21 @@ function applyProgressiveDisclosure(){
 // Task 5 — which segment's model-history drawer is expanded (shell UI state, per-seg)
 let _modelDrawerOpen = {};
 function toggleModelDrawer(segId){ _modelDrawerOpen[segId] = !_modelDrawerOpen[segId]; renderSegments(); }
+// The core economic decision, made visible: cost → your price → profit per car.
+function priceChainHtml(pm){
+  const margin = pm.price - pm.cost;
+  return `<span class="pc-cell">Cost to build<b>$${pm.cost}k</b></span><span class="pc-arrow">→</span>`
+    + `<span class="pc-cell">Your price<b class="pc-price">$${pm.price.toFixed(1)}k</b></span><span class="pc-arrow">→</span>`
+    + `<span class="pc-cell">Profit per car<b class="pc-profit ${margin>=0?'up':'down'}">${margin>=0?'+':'−'}$${Math.abs(margin).toFixed(1)}k</b></span>`;
+}
+// …and what that price buys you: buyers won → money earned by this model.
+function priceProjHtml(s, pm, sh){
+  const share = sh ? sh.share : 0;
+  const units = Math.round(s.demand * share);
+  const modelProfit = Math.round(units * (pm.price - pm.cost));
+  return `At this price: <b>${Math.round(share*100)}%</b> of ${s.name} buyers ≈ <b>${units}k cars</b>/q`
+    + ` → <b>${modelProfit>=0?'+':'−'}$${Math.abs(modelProfit)}M</b>/q from this model`;
+}
 function renderSegments(){
   const player = st.companies.find(c=>c.player);
   const wrap = document.getElementById('segments');
@@ -3643,8 +3846,6 @@ function renderSegments(){
     /* current model block */
     if(pm){
       const sh = shares['you'];
-      const shPct = sh ? Math.round(sh.share*100) : 0;
-      const margin = (pm.price - pm.cost).toFixed(1);
       const nov = Math.round(pm.novelty*100);
       const novColor = nov>60?'var(--green)':nov>35?'var(--amber)':'var(--red)';
       const floorPrice = +(pm.cost*1.02).toFixed(1);
@@ -3664,13 +3865,10 @@ function renderSegments(){
           ${isHalo?`<div class="halo-badge">★ Halo · +brand/q</div>`:''}
         </div>
         <div class="price-ctl">
-          <div class="price-row"><span class="k">Your price</span>
-            <span class="v" id="pv-${s.id}">$${pm.price.toFixed(1)}k</span></div>
+          <div class="price-chain" id="pc-${s.id}">${priceChainHtml(pm)}</div>
           <input type="range" id="pr-${s.id}"
             min="${floorPrice}" max="${ceilPrice}" step="0.1" value="${pm.price}">
-          <div class="share-proj" id="sp-${s.id}">
-            You'd win <b>${shPct}%</b> of ${s.name} buyers<span class="margin-note"> · $${margin}k/car profit</span>
-          </div>
+          <div class="share-proj" id="sp-${s.id}">${priceProjHtml(s, pm, sh)}</div>
         </div>
       </div>`;
 
@@ -3751,16 +3949,17 @@ function renderSegments(){
       slider.addEventListener('input', e => {
         if(!pm) return;
         pm.price = parseFloat(e.target.value);
-        document.getElementById(`pv-${s.id}`).textContent = `$${pm.price.toFixed(1)}k`;
+        const pcEl = document.getElementById(`pc-${s.id}`);
+        if(pcEl) pcEl.innerHTML = priceChainHtml(pm);
 
-        // update share projection text for all segments (price in one seg doesn't affect others,
-        // but this keeps deltas consistent if player has multiple sliders open)
+        // update the price → buyers → money projection for all segments (price in one seg
+        // doesn't affect others, but this keeps deltas consistent across open sliders)
         SEGS.forEach(ss => {
           const el = document.getElementById(`sp-${ss.id}`); if(!el) return;
           const sh2 = segShares(ss.id, st)['you'];
           const mm  = player.models.find(m=>m.segId===ss.id&&m.active);
           if(!mm) return;
-          el.innerHTML = `You'd win <b>${sh2?Math.round(sh2.share*100):0}%</b> of ${ss.name} buyers<span class="margin-note"> · $${(mm.price-mm.cost).toFixed(1)}k/car profit</span>`;
+          el.innerHTML = priceProjHtml(ss, mm, sh2);
         });
 
         // sync this segment's sharebar, legend, and car icons in lockstep
@@ -4435,6 +4634,98 @@ function dramatizeEarlyLog(st){
   entry.html = opener + ' ' + entry.html;
 }
 
+/* ── quarterly money summary (clarity pass) ─────────────────────────────────
+   Pure presentation: reads sim results, never mutates them. snapshotQuarter()
+   runs BEFORE advance(); buildQuarterSummary() compares after, and picks the
+   ONE reason this quarter's money changed. */
+function snapshotQuarter(){
+  const player = st.companies.find(c=>c.player);
+  const snap = { profit: st.lastProfit, units: st.lastUnits, rd: st._lastRdSpend||0,
+                 perModel:{}, rivalPrice:{} };
+  player.models.filter(m=>m.active).forEach(m=>{
+    snap.perModel[m.segId] = { units: m.lastUnits||0, price: m.price, nov: m.novelty };
+  });
+  SEGS.forEach(s=>{
+    const r = cheapestRival(s.id);
+    if(r) snap.rivalPrice[s.id] = r.price;
+  });
+  return snap;
+}
+function cheapestRival(segId){
+  let best = null;
+  st.companies.filter(c=>!c.player).forEach(c=>{
+    const m = c.models.find(m2=>m2.segId===segId && m2.active);
+    if(m && (!best || m.price < best.price)) best = { co:c.name, price:m.price };
+  });
+  return best;
+}
+function quarterWhy(prev, rdSpend){
+  const player = st.companies.find(c=>c.player);
+  const active = player.models.filter(m=>m.active);
+  const nameOf = m => m.nameplate || getSeg(m.segId).name;
+  if(st.tick <= 1){
+    const m = active[0];
+    if(m){
+      const pct = Math.round((m.lastShare||0)*100);
+      return `Your first quarter on sale — <b>${pct}%</b> of ${getSeg(m.segId).name} buyers picked the ${nameOf(m)}. Every sale banked its price minus its build cost.`;
+    }
+    return 'No cars on sale yet — nothing earned until one is.';
+  }
+  if((st.lastEvents||[]).some(e=>e.includes('Recall')))
+    return 'A <b>recall</b> hit this quarter — it cost cash and dented your brand.';
+  const rollout = active.find(m => prev.perModel[m.segId] === undefined);
+  if(rollout) return `The <b>${nameOf(rollout)}</b> just reached showrooms — a new line of sales.`;
+  const firstSales = active.find(m => (m.lastUnits||0) > 0
+    && Math.abs((m.totalUnits||0) - (m.lastUnits||0)) < 0.5);
+  if(firstSales){
+    const pct = Math.round((firstSales.lastShare||0)*100);
+    return `First sales for the <b>${nameOf(firstSales)}</b> — ${pct}% of ${getSeg(firstSales.segId).name} buyers picked it.`;
+  }
+  if(st.lastCapFill != null && st.lastCapFill < 0.97)
+    return 'Buyers wanted <b>more cars than your plant could build</b> — capacity is capping your sales.';
+  // biggest per-model sales swing vs last quarter, then explain it
+  let big = null, bigAbs = 1.5;
+  active.forEach(m=>{
+    const p = prev.perModel[m.segId]; if(!p) return;
+    const d = (m.lastUnits||0) - p.units;
+    if(Math.abs(d) > bigAbs){ big = { m, d, p }; bigAbs = Math.abs(d); }
+  });
+  if(big){
+    const { m, d, p } = big;
+    const nm = nameOf(m), dk = Math.abs(Math.round(d)), sg = getSeg(m.segId).name;
+    const priceDelta = m.price - p.price;
+    if(priceDelta > 0.2 && d < 0)
+      return `You <b>raised the ${nm}'s price</b> — more profit on each car, but ${dk}k fewer sold.`;
+    if(priceDelta < -0.2 && d > 0)
+      return `You <b>cut the ${nm}'s price</b> — less on each car, but ${dk}k more sold.`;
+    const rNow = cheapestRival(m.segId), rPrev = prev.rivalPrice[m.segId];
+    if(d < 0 && rNow && rPrev != null && rNow.price < rPrev - 0.2 && rNow.price < m.price)
+      return `<b>${rNow.co} undercut your ${nm}</b> in ${sg} — you sold ${dk}k fewer.`;
+    if(d < 0 && m.novelty < 0.35)
+      return `The <b>${nm} is aging</b> — buyers drifted to fresher rivals (${dk}k fewer sold).`;
+    if(d > 0 && m.novelty > 0.6)
+      return `The <b>${nm} is fresh</b> and selling well — ${dk}k more than last quarter.`;
+    return d > 0
+      ? `The <b>${nm}</b> gained ground — ${dk}k more sales than last quarter.`
+      : `The <b>${nm}</b> lost ground — ${dk}k fewer sales as rivals pressed.`;
+  }
+  if(st.lastProfit < prev.profit - 8 && rdSpend > (prev.rd||0) + 8)
+    return `You spent <b>$${Math.round(rdSpend-(prev.rd||0))}M more on R&D</b> — profit dipped now to make better cars later.`;
+  return 'A steady quarter — sales held near last quarter\'s level.';
+}
+function buildQuarterSummary(prev, rdSpend){
+  const units = st.lastUnits || 0;
+  const gross = st.lastProfit + st.lastOverhead + rdSpend;   // margin earned on cars
+  return {
+    q: `Q${st.quarter===1?4:st.quarter-1} ${st.quarter===1?st.year-1:st.year}`,
+    profit: Math.round(st.lastProfit),
+    units: Math.round(units),
+    perCar: units > 0 ? +(gross/units).toFixed(1) : null,
+    fixed: Math.round(st.lastOverhead + rdSpend),
+    why: quarterWhy(prev, rdSpend),
+  };
+}
+
 function doAdvance(){
   try {
     snapshotMatchup();    // remember who's ahead of us so we can celebrate overtakes
@@ -4444,6 +4735,10 @@ function doAdvance(){
       ? MarqueWorld.deriveCampusInputs(MarqueWorld.getCampus())
       : { rdBonuses:{eng:0,eff:0,mfg:0}, qualityCenter:{warrantyCash:0}, testTrackLevel:0 };
     const campusRD = campusInputs.rdBonuses || {};
+    // snapshot the pre-advance quarter so the money summary can explain WHY it changed
+    const prevQ = snapshotQuarter();
+    const rdTotal = pendingRD.eng + pendingRD.eff + pendingRD.mfg
+                  + (campusRD.eng||0) + (campusRD.eff||0) + (campusRD.mfg||0);
     advance(st, { rd:{ eng: pendingRD.eng + (campusRD.eng||0),
                        eff: pendingRD.eff + (campusRD.eff||0),
                        mfg: pendingRD.mfg + (campusRD.mfg||0) },
@@ -4472,6 +4767,9 @@ function doAdvance(){
       if(m.active) m.bestQ = Math.max(m.bestQ||0, m.lastUnits||0);
     });
     completeStudioProject();   // tick the Studio project; a finished car rolls out if ready
+    // plain-English money summary for the quarter that just ran (persisted in the save)
+    st._lastRdSpend = rdTotal;
+    st._qSummary = buildQuarterSummary(prevQ, rdTotal);
     studioSel=null;
     recordValuation();   // reprice the company for real this quarter (ticker/sparkline)
     if(typeof MarqueWorld!=='undefined') MarqueWorld.setSimState(st);
@@ -4490,8 +4788,10 @@ function doAdvance(){
 }
 function renderGoalBanner(){
   const el = document.getElementById('goalBanner');
+  const mg = document.getElementById('mapGoal');
   if(st.sandbox){
     el.innerHTML = `<span style="color:var(--dim);font-family:var(--sans);font-size:11px">SANDBOX — no victory condition · play forever</span>`;
+    if(mg){ mg.style.display=''; mg.innerHTML = `Sandbox — no win condition · build at your own pace`; }
     return;
   }
   const obj = st.objective;
@@ -4504,6 +4804,13 @@ function renderGoalBanner(){
     `Goal — <b style="color:var(--hi)">${stat.name}</b> by Q${obj.deadlineQuarter}&nbsp;${obj.deadlineYear}`
     + ` &nbsp;·&nbsp; <span style="color:${color}">${stat.detail}</span>`
     + ` &nbsp;·&nbsp; ${qleft} quarter${qleft!==1?'s':''} left`;
+  // always-visible win condition over the map — never buried in the drawer
+  if(mg){
+    mg.style.display='';
+    mg.innerHTML = `🏁 Win: <b>${goalPhrase(obj.id)}</b>`
+      + ` · <span style="color:${color}">${stat.detail}</span>`
+      + ` · ${qleft}q left`;
+  }
 }
 
 function renderEndScreen(){
@@ -4581,15 +4888,20 @@ function coachStep(){
   if(!st || st.launchFlow || st.over) return null;
   const capped = (st.lastCapFill!=null && st.lastCapFill<0.97) && st.tick>=1;
   if(st.tick < 1)   // earlyGame: build menu is hidden — the only move is to run the quarter
-    return { msg:'<b>Advance the quarter</b> to put your car on sale and watch the market react.', dom:'#advBtn', bld:null };
+    return { msg:'Your price is set above cost, so <b>every sale earns you the difference</b>. <b>Advance the quarter</b> to sell your first cars and see what you made.', dom:'#advBtn', bld:null };
   if(!hasStudio())
-    return { msg:'Build a <b>Design Studio</b> — it’s where you design new cars.', dom:'.wbuild-btn[data-build="studio"]', bld:null };
+    return { msg:'Money comes from selling cars. Build a <b>Design Studio</b> so you can add a second model — <b>two models, two streams of profit</b>.', dom:'.wbuild-btn[data-build="studio"]', bld:null };
   if(!st.studioProject && !st._coachStudioDone)
-    return { msg:'Click the <b>Design Studio</b> on the map to develop your next car.', dom:null, bld:'studio' };
+    return { msg:'Click the <b>Design Studio</b> on the map and start a second car — more models means more buyers paying you.', dom:null, bld:'studio' };
   if(st.studioProject)
-    return { msg:'<b>Advance the quarter</b> — your car is being built in the Studio.', dom:'#advBtn', bld:null };
+    return { msg:'<b>Advance the quarter</b> — you keep earning price-minus-cost on every car sold while the new model is developed.', dom:'#advBtn', bld:null };
   if(capped)
-    return { msg:'Your plant is <b>maxed out</b>. Upgrade it or add an <b>Assembly Plant</b>.', dom:'.wbuild-btn[data-build="assembly"]', bld:'assembly' };
+    return { msg:'You\'re <b>selling every car you can build</b> — buyers who wanted one left empty-handed. Add or upgrade an <b>Assembly Plant</b> to sell more.', dom:'.wbuild-btn[data-build="assembly"]', bld:'assembly' };
+  // teach the response move once: a stale model is losing buyers (and money) to rivals
+  const player = st.companies.find(c=>c.player);
+  const stale = player.models.find(m=>m.active && m.novelty < 0.32);
+  if(stale && st.tick >= 4)
+    return { msg:`Your <b>${stale.nameplate||getSeg(stale.segId).name}</b> is aging — buyers are drifting to fresher rivals. <b>Refresh or redesign it</b> in the Studio (or cut its price) to win them back.`, dom:null, bld:'studio' };
   return null;   // first loop complete — coaching done
 }
 function dismissTutorial(){
