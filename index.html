@@ -873,7 +873,6 @@ return { newGame, advance, segShares, playerDesign, playerRefresh, playerRetire,
          quoteDesign, objectiveStatus, objectiveMet, makeObjective, OBJECTIVES, endRecap,
          SEGS, ENGINES, TRIMS, C };
 })();
-
 </script>
 <script>
 /* marque-world.js — MARQUE campus builder (PART B, v2 architecture slice)
@@ -1077,6 +1076,7 @@ const BS_COLORS_WORLD = { sedan:'#E8584B', suv:'#3F8EE0', pickup:'#46B97A', coup
 
 // post-advance production burst: counts down for 2.5s after triggerBurst()
 let burstT = 0;
+let burstMag = 1;   // burst intensity, scaled by how strong production was this quarter
 
 // ── ambient campus agents (workers + forklift + finished cars) ────────────────
 // Density and motion scale with real sim output (units built, utilization): a
@@ -1233,9 +1233,9 @@ function stepAgents(dt){
   // and the burst right after Advance briefly floods the lot.
   const plants = plantList();
   if(plants.length && act.units>0){
-    const burstBoost = burstT>0 ? 2.4 : 1;
+    const burstBoost = burstT>0 ? (1.6 + burstMag) : 1;   // denser when the quarter's output was strong
     const interval = lerp(2.6, 0.35, act.busy) / burstBoost;
-    const maxCars = Math.min(2 + Math.round(act.busy*16), 22);
+    const maxCars = Math.min(2 + Math.round(act.busy*16) + (burstT>0 ? Math.round(burstMag*6) : 0), 30);
     carSpawnT -= dt;
     if(carSpawnT<=0 && cars.length<maxCars){
       carSpawnT = interval*(0.6+Math.random()*0.8);
@@ -1295,6 +1295,54 @@ function drawParkedCars(){
     }
     if(placed>=want) break;
   }
+}
+
+// does the player have any active recall this quarter? (read-only — for warnings)
+function simHasRecall(){
+  if(!factorySimState) return false;
+  const p = factorySimState.companies && factorySimState.companies.find(c=>c.player);
+  return !!(p && p.models && p.models.some(m=>m.active && m.recallQ>0));
+}
+
+// rounded-rect path helper (canvas)
+function roundRect(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+
+// in-map badge floating over the Design Studio while a car is in development (Task 2).
+// The active project lives in game state (factorySimState.studioProject, read-only here).
+function drawStudioBadge(o, d, lv, proj){
+  const sc=effSc();
+  const anchor=iso(o.x+d.w/2, o.y-0.05, lv.h+1.05);
+  const name=proj.nameplate || 'New model';
+  const sub=(proj.segName||'') + ' · ' + proj.quartersLeft + 'q left';
+  ctx.save();
+  ctx.font=`700 ${Math.round(10*sc)}px Archivo,system-ui,sans-serif`;
+  const w1=ctx.measureText(name).width;
+  ctx.font=`500 ${Math.round(8.5*sc)}px Archivo,system-ui,sans-serif`;
+  const w2=ctx.measureText(sub).width;
+  const bw=Math.max(w1,w2,54*sc)+16*sc, bh=32*sc;
+  const bx=anchor.x-bw/2, by=anchor.y-bh;
+  // connector stem down to the roof
+  ctx.strokeStyle='rgba(124,111,214,.7)'; ctx.lineWidth=1.2*sc;
+  ctx.beginPath(); ctx.moveTo(anchor.x, by+bh); ctx.lineTo(anchor.x, anchor.y+6*sc); ctx.stroke();
+  // panel
+  roundRect(bx,by,bw,bh,6*sc);
+  ctx.fillStyle='rgba(26,29,36,.94)'; ctx.fill();
+  ctx.strokeStyle='#7C6FD6'; ctx.lineWidth=1.3*sc; ctx.stroke();
+  ctx.textAlign='center';
+  ctx.fillStyle='#ECEEF1'; ctx.font=`700 ${Math.round(10*sc)}px Archivo,system-ui,sans-serif`;
+  ctx.fillText(name, anchor.x, by+12*sc);
+  ctx.fillStyle='#a89bf0'; ctx.font=`500 ${Math.round(8.5*sc)}px Archivo,system-ui,sans-serif`;
+  ctx.fillText(sub, anchor.x, by+22*sc);
+  // progress bar
+  const pw=bw-12*sc, px=bx+6*sc, py=by+bh-5*sc;
+  const prog=proj.totalQuarters ? clamp(1-proj.quartersLeft/proj.totalQuarters,0,1) : 0;
+  ctx.fillStyle='rgba(255,255,255,.12)'; ctx.fillRect(px,py,pw,2.6*sc);
+  ctx.fillStyle='#7C6FD6'; ctx.fillRect(px,py,pw*prog,2.6*sc);
+  ctx.restore();
 }
 
 function drawBuildingAnimated(o){
@@ -1413,10 +1461,12 @@ function drawBuildingAnimated(o){
     ctx.strokeStyle=`rgba(59,142,165,${0.07+pulse*0.14})`; ctx.lineWidth=0.8;
     ctx.beginPath(); ctx.arc(p.x,p.y,r+5*effSc(),0,Math.PI*2); ctx.stroke();
   } else if(o.type==='studio'){
-    const pulse=(Math.sin(wT*2.2)*0.5+0.5);
+    const proj = factorySimState && factorySimState.studioProject;
+    const pulse=(Math.sin(wT*(proj?3.4:2.2))*0.5+0.5);   // pulses faster while a car is in development
     const p=iso(o.x+d.w/2,o.y,lv.h+0.32);
     ctx.fillStyle=`rgba(124,111,214,${0.42+pulse*0.38})`;
     ctx.beginPath(); ctx.arc(p.x,p.y,(2.8+pulse*2.2)*effSc(),0,Math.PI*2); ctx.fill();
+    if(proj) drawStudioBadge(o, d, lv, proj);
   } else if(o.type==='testtrack'){
     // Animated speed lines — a short dash sweeping left-to-right over the track
     const sc=effSc(), ctr=iso(o.x+d.w/2, o.y+d.d/2, lv.h+0.12);
@@ -1442,6 +1492,17 @@ function drawBuildingAnimated(o){
     ctx.beginPath(); ctx.arc(p.x,p.y,(5+pulse*4)*effSc(),0,Math.PI*2); ctx.stroke();
     ctx.strokeStyle=`rgba(78,154,110,${0.08+pulse*0.12})`; ctx.lineWidth=0.9;
     ctx.beginPath(); ctx.arc(p.x,p.y,(9+pulse*5)*effSc(),0,Math.PI*2); ctx.stroke();
+    // a recall this quarter → temporary red ⚠ over the Quality Center (Task 7)
+    if(simHasRecall()){
+      const rpulse=0.5+Math.sin(wT*4.8)*0.5;
+      const rp=iso(o.x+d.w/2,o.y+d.d/2,lv.h+0.62);
+      ctx.save();
+      ctx.globalAlpha=0.55+rpulse*0.4;
+      ctx.fillStyle='#E5605E'; ctx.textAlign='center';
+      ctx.font=`bold ${Math.round(15*effSc())}px sans-serif`;
+      ctx.fillText('⚠', rp.x, rp.y);
+      ctx.restore();
+    }
   }
 }
 
@@ -2030,7 +2091,7 @@ function setLabFocus(id, focus){
 }
 
 // ── lifecycle ────────────────────────────────────────────────────────────────
-function triggerBurst(){ burstT = 2.5; }
+function triggerBurst(){ burstMag = 0.6 + simActivity().busy*1.6; burstT = 2.5; }   // stronger production → denser burst
 
 function step(dt){
   wT += dt;
@@ -2299,7 +2360,7 @@ return {
     display:flex;gap:8px;align-items:center;flex-wrap:wrap;z-index:3}
 
   /* ── live broadcast ticker (Task 3) ── */
-  .ticker-band{position:absolute;top:0;left:0;right:0;height:26px;z-index:5;
+  .ticker-band{position:absolute;top:0;left:0;right:0;height:26px;z-index:5;pointer-events:none;
     background:linear-gradient(90deg,rgba(12,14,20,.96),rgba(18,22,32,.93));
     border-bottom:1px solid rgba(55,123,248,.25);overflow:hidden;
     display:flex;align-items:center;font-family:var(--sans);font-size:11px;white-space:nowrap;
@@ -2416,6 +2477,13 @@ return {
   .std-opt:hover{color:var(--hi);border-color:rgba(255,255,255,.2)}
   .std-opt.sel{background:rgba(55,123,248,.14);color:var(--amber);border-color:var(--amber)}
   .std-cost{font-family:var(--sans);font-size:11px;color:var(--hi);margin:9px 0 7px;font-weight:600}
+  /* in-development project panel (docked studio inspector) */
+  .std-project{border-top:1px solid var(--line);padding-top:9px}
+  .std-projname{font-family:var(--sans);font-size:16px;font-weight:800;color:var(--hi);line-height:1.1}
+  .std-projsub{font-family:var(--sans);font-size:10px;color:#a89bf0;margin:2px 0 8px;text-transform:capitalize}
+  .std-projbar{height:6px;background:rgba(255,255,255,.08);border-radius:4px;overflow:hidden;margin-bottom:6px}
+  .std-projbar i{display:block;height:100%;background:#7C6FD6;border-radius:4px;transition:width .4s ease}
+  .std-projq{font-family:var(--sans);font-size:9.5px;color:var(--dim)}
 
   /* ── floater feedback ── */
   .floater{position:fixed;left:50%;transform:translateX(-50%);
@@ -2446,12 +2514,25 @@ return {
   .rival-stats b{color:var(--hi)}
 
   /* ── model review card (Motor1-style, shown on launch/redesign) ── */
-  #reviewCard{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
-    background:var(--panel);border:1px solid var(--amber);border-radius:14px;
-    padding:20px 22px;min-width:280px;max-width:340px;z-index:220;
-    font-family:var(--sans);box-shadow:0 8px 32px rgba(0,0,0,.55);
-    animation:reviewIn .22s ease}
-  @keyframes reviewIn{from{opacity:0;transform:translate(-50%,-54%)}to{opacity:1;transform:translate(-50%,-50%)}}
+  /* Review card — a non-blocking slide-in from the right edge. No backdrop, never
+     traps the board (map stays fully interactive). Rests collapsed; click expands +
+     pins, the × or the auto-timeout (collapsed only) hides. */
+  #reviewCard{position:fixed;top:74px;right:16px;
+    background:#1A1D24;border:1px solid var(--amber);border-radius:14px;
+    padding:18px 20px;width:300px;max-width:calc(100vw - 32px);z-index:220;
+    font-family:var(--sans);box-shadow:0 8px 32px rgba(0,0,0,.55);cursor:pointer}
+  .rv-x{position:absolute;top:8px;right:10px;background:none;border:none;color:var(--dim);
+    font-size:17px;line-height:1;cursor:pointer;padding:2px 4px}
+  .rv-x:hover{color:var(--hi)}
+  #reviewCard.rv-collapsed .rv-details{display:none}
+  #reviewCard.rv-expanded .rv-more{display:none}
+  #reviewCard.rv-expanded{cursor:default}
+  .rv-more{margin-top:12px;font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;
+    color:var(--amber);opacity:.85}
+  #reviewCard.rv-in{animation:rvSlideIn .3s cubic-bezier(.2,.8,.2,1)}
+  #reviewCard.rv-out{animation:rvSlideOut .28s ease forwards}
+  @keyframes rvSlideIn{from{transform:translateX(115%)}to{transform:translateX(0)}}
+  @keyframes rvSlideOut{from{transform:translateX(0)}to{transform:translateX(115%)}}
   .rv-brand{font-size:8px;letter-spacing:.24em;text-transform:uppercase;color:var(--amber);margin-bottom:10px}
   .rv-name{font-size:22px;font-weight:700;color:var(--hi);line-height:1;margin-bottom:2px}
   .rv-spec{font-size:10px;color:var(--dim);margin-bottom:14px}
@@ -2467,7 +2548,6 @@ return {
     background:transparent;color:var(--dim);border:1px solid var(--line);border-radius:7px;
     padding:7px;cursor:pointer}
   .rv-dismiss:hover{color:var(--hi);border-color:rgba(255,255,255,.25)}
-  #reviewOverlay{position:fixed;inset:0;z-index:219;background:rgba(10,12,18,.55)}
 
   /* ── dashboard tabs ── */
   .dashboard{margin-bottom:14px}
@@ -2513,7 +2593,7 @@ return {
   }
 
   /* ── launch screen ── */
-  #launchOverlay,#studioOverlay{position:fixed;inset:0;z-index:100;background:rgba(10,12,18,.94);
+  #launchOverlay{position:fixed;inset:0;z-index:100;background:rgba(10,12,18,.94);
     display:none;align-items:center;justify-content:center;padding:20px}
   .studio-actions{display:flex;flex-direction:column;gap:8px;margin-top:6px}
   .studio-actions .btn{align-self:flex-start}
@@ -2641,14 +2721,11 @@ return {
 
 <!-- launch screen overlay — shown on new game, hidden after first car is designed -->
 <div id="launchOverlay"></div>
-<!-- Design Studio overlay — the in-game car-design flow, opened from the studio building -->
-<div id="studioOverlay"></div>
 <!-- first-run tutorial checklist — dismissible, localStorage-persisted -->
 <div id="tutCard" style="display:none"></div>
 <!-- world hover tooltip — fixed-position, follows cursor -->
 <div class="world-tooltip" id="worldTooltip" style="display:none"></div>
-<!-- Motor1-style review card — shown on model launch/redesign, auto-dismisses -->
-<div id="reviewOverlay" style="display:none" onclick="dismissReviewCard()"></div>
+<!-- Motor1-style review card — non-blocking side slide-in, auto-dismisses -->
 <div id="reviewCard" style="display:none"></div>
 
 <script>
@@ -2716,6 +2793,8 @@ const RIVAL_PERSONA = {
 
 /* ── Motor1-style review card ────────────────────────────────────────────── */
 let _reviewDismissTimer = null;
+let _reviewCount = 0;              // first review shows a touch longer than later ones
+let _reviewClickHandler = null;
 
 function buildReviewCard(m){
   const seg = SEGS.find(s=>s.id===m.segId)||{name:m.segId,refPrice:25,spread:5,w:{}};
@@ -2774,32 +2853,56 @@ function showReviewCard(m){
   const trim = TRIMS[m.trimId]||{name:m.trimId};
 
   const card = document.getElementById('reviewCard');
-  const overlay = document.getElementById('reviewOverlay');
-  if(!card||!overlay) return;
+  if(!card) return;
 
+  // Non-blocking side card: rests collapsed on the right, never captures map clicks.
+  // Click the card → expand + pin; the × (or the auto-timeout while collapsed) hides it.
   card.innerHTML = `
+    <button class="rv-x" title="Dismiss" onclick="dismissReviewCard()">×</button>
     <div class="rv-brand">Motor1 Review · ${st.year}</div>
     <div class="rv-name">${m.nameplate}</div>
     <div class="rv-spec">${eng.name} ${seg.name} · ${trim.name} · $${m.price.toFixed(1)}k</div>
     <div class="rv-verdict">${verdict}</div>
-    <div class="rv-row"><span class="rv-lbl">★ Strength</span><span class="rv-val">${strength}</span></div>
-    <div class="rv-row"><span class="rv-lbl">✗ Weakness</span><span class="rv-val">${weakness}</span></div>
-    <div class="rv-row"><span class="rv-lbl">Projects to</span><span class="rv-val">${buyer}</span></div>
-    <div class="rv-row"><span class="rv-lbl">Rival threat</span><span class="rv-val rv-rival">${rivalLine}</span></div>
-    <button class="rv-dismiss" onclick="dismissReviewCard()">Tap to dismiss</button>`;
+    <div class="rv-details">
+      <div class="rv-row"><span class="rv-lbl">★ Strength</span><span class="rv-val">${strength}</span></div>
+      <div class="rv-row"><span class="rv-lbl">✗ Weakness</span><span class="rv-val">${weakness}</span></div>
+      <div class="rv-row"><span class="rv-lbl">Projects to</span><span class="rv-val">${buyer}</span></div>
+      <div class="rv-row"><span class="rv-lbl">Rival threat</span><span class="rv-val rv-rival">${rivalLine}</span></div>
+    </div>
+    <div class="rv-more">▸ tap for the full read</div>`;
 
-  overlay.style.display = 'block';
+  card.classList.remove('rv-out','rv-expanded');
+  card.classList.add('rv-collapsed');
   card.style.display = 'block';
+  card.classList.remove('rv-in'); void card.offsetWidth; card.classList.add('rv-in');  // replay entrance
 
+  // click the card body → expand + pin (does NOT dismiss; only the × / timeout hides)
+  card.onclick = (e)=>{ if(e.target.closest('.rv-x')) return; expandReviewCard(); };
+
+  // auto-dismiss ONLY while still collapsed: first review 4s, later ones 2s
+  const ms = _reviewCount===0 ? 4000 : 2000;
+  _reviewCount++;
   if(_reviewDismissTimer) clearTimeout(_reviewDismissTimer);
-  _reviewDismissTimer = setTimeout(dismissReviewCard, 6000);
+  _reviewDismissTimer = setTimeout(()=>{
+    const c=document.getElementById('reviewCard');
+    if(c && !c.classList.contains('rv-expanded')) dismissReviewCard();
+  }, ms);
+}
+
+// clicking the card expands it to the full read and pins it open (cancels auto-dismiss)
+function expandReviewCard(){
+  const card = document.getElementById('reviewCard');
+  if(!card || card.style.display==='none') return;
+  card.classList.remove('rv-collapsed'); card.classList.add('rv-expanded');
+  if(_reviewDismissTimer){ clearTimeout(_reviewDismissTimer); _reviewDismissTimer = null; }
 }
 
 function dismissReviewCard(){
   const card = document.getElementById('reviewCard');
-  const overlay = document.getElementById('reviewOverlay');
-  if(card) card.style.display = 'none';
-  if(overlay) overlay.style.display = 'none';
+  if(card && card.style.display!=='none'){
+    card.classList.remove('rv-in'); card.classList.add('rv-out');
+    setTimeout(()=>{ if(card.classList.contains('rv-out')) card.style.display='none'; }, 300);
+  }
   if(_reviewDismissTimer){ clearTimeout(_reviewDismissTimer); _reviewDismissTimer = null; }
 }
 
@@ -3804,11 +3907,15 @@ function defaultDesignFor(segId){
 // shows the design panel. No full-screen modal.
 function openStudio(segId){
   if(!hasStudio()){ armStudioBuild(); return; }   // safety: no studio → route to building one
-  studioSel = segId ? defaultDesignFor(segId) : null;
-  if(typeof MarqueWorld!=='undefined'){
+  const selStudio = ()=>{ if(typeof MarqueWorld!=='undefined'){
     const studio = MarqueWorld.getCampus().objects.find(o=>o.type==='studio');
-    if(studio) MarqueWorld.selectBuilding(studio.id);
+    if(studio) MarqueWorld.selectBuilding(studio.id); } };
+  if(st.studioProject){   // one project at a time — open the panel so they see progress
+    selStudio(); toast('The Studio is busy developing '+(st.studioProject.nameplate||'a car')+'.', 'error');
+    render(); return;
   }
+  studioSel = segId ? defaultDesignFor(segId) : null;
+  selStudio();
   render();
 }
 function studioPickSeg(segId){ studioSel = defaultDesignFor(segId); refreshStudioPanel(); }
@@ -3820,18 +3927,48 @@ function studioSetDesign(engId, trimId){
 function studioBackToSegs(){ studioSel = null; refreshStudioPanel(); }
 // re-render the docked studio inspector in place (no overlay)
 function refreshStudioPanel(){ if(typeof MarqueWorld!=='undefined') MarqueWorld.renderPanels(); }
+// Studio projects: designing/redesigning takes time and shows on the Studio building
+// (Tasks 2–3). New models take 2 quarters; a redesign reuses the platform, so 1.
+function projectQuarters(isRedesign){ return isRedesign ? 1 : 2; }
+function activeStudioProject(){ return st ? st.studioProject : null; }
+
+// Start a project instead of launching instantly. Cost is charged at completion
+// (playerDesign), so we verify affordability now and re-check when it rolls out.
 function studioConfirm(){
   if(!studioSel) return;
-  const result = playerDesign(st, studioSel.segId, studioSel.engId, studioSel.trimId);
-  if(!result.ok){ toast(result.reason, 'error'); return; }
-  ensureNameplates(st);
-  const dm = st.companies.find(c=>c.player).models.find(m=>m.segId===studioSel.segId&&m.active);
-  const dHalo = dm && dm.segId==='coupe' && (dm.engId==='V8'||dm.engId==='V12');
-  showFloater(dHalo ? `${dm.nameplate||'Coupe'} redesigned · halo active` : `${dm ? (dm.nameplate||studioSel.segId) : studioSel.segId} redesigned`, 'var(--green)');
-  if(dm) showReviewCard(dm);
+  if(st.studioProject){ toast('The Studio is already developing '+(st.studioProject.nameplate||'a car')+'.', 'error'); return; }
+  const s = SEGS.find(x=>x.id===studioSel.segId);
+  const player = st.companies.find(c=>c.player);
+  const q = quoteDesign(st, studioSel.segId, studioSel.engId, studioSel.trimId);
+  if(player.cash < q.total){ toast('Need $'+q.total+'M to start this project.', 'error'); return; }
+  const existing = player.models.find(m=>m.segId===studioSel.segId&&m.active);
+  const isRedesign = !!existing;
+  const nameplate = (isRedesign && existing.nameplate) ? existing.nameplate : modelName(studioSel.segId, studioSel.engId);
+  const qn = projectQuarters(isRedesign);
+  st.studioProject = { segId:studioSel.segId, engId:studioSel.engId, trimId:studioSel.trimId,
+                       segName:s.name, nameplate, isRedesign, quartersLeft:qn, totalQuarters:qn };
+  showFloater(`${nameplate} — ${isRedesign?'redesign':'design'} started · ${qn}q in the Studio`, '#7C6FD6');
   studioSel = null;
-  render();          // re-renders the docked studio panel back to the model list
+  if(typeof MarqueWorld!=='undefined') MarqueWorld.setSimState(st);   // badge appears immediately
+  render();          // docked studio panel now shows the in-development project
   saveGame();
+}
+
+// Called from doAdvance: tick the active project; when ready, commit it to the economy.
+function completeStudioProject(){
+  const proj = st.studioProject;
+  if(!proj) return;
+  proj.quartersLeft = Math.max(0, proj.quartersLeft - 1);
+  if(proj.quartersLeft > 0) return;                 // still in development
+  const result = playerDesign(st, proj.segId, proj.engId, proj.trimId);
+  if(!result.ok){ proj.quartersLeft = 1; toast(`${proj.nameplate}: ${result.reason} — held in the Studio.`, 'error'); return; }
+  ensureNameplates(st);
+  const dm = st.companies.find(c=>c.player).models.find(m=>m.segId===proj.segId&&m.active);
+  if(dm) dm.nameplate = proj.nameplate;             // keep the name the badge showed
+  const halo = dm && dm.segId==='coupe' && (dm.engId==='V8'||dm.engId==='V12');
+  showFloater(halo ? `${proj.nameplate} rolls out · halo active` : `${proj.nameplate} rolls out of the Studio`, 'var(--green)');
+  st.studioProject = null;
+  if(dm) showReviewCard(dm);                        // non-blocking side card on completion
 }
 
 // The docked Studio panel body (rendered inside the studio building's inspector by
@@ -3842,6 +3979,19 @@ function studioBody(){
   const perk = lvl>=2
     ? `<div class="std-perk ok">L2 · refreshes 30% cheaper, restore to 94%</div>`
     : `<div class="std-perk">L1 · upgrade for cheaper refreshes</div>`;
+
+  // an active project takes over the panel (one project at a time)
+  const proj = st.studioProject;
+  if(proj){
+    const prog = proj.totalQuarters ? Math.round((1-proj.quartersLeft/proj.totalQuarters)*100) : 0;
+    return perk + `<div class="std-project">
+      <div class="std-formhead">In development</div>
+      <div class="std-projname">${proj.nameplate}</div>
+      <div class="std-projsub">${proj.segName} · ${proj.isRedesign?'redesign':'new model'}</div>
+      <div class="std-projbar"><i style="width:${prog}%"></i></div>
+      <div class="std-projq">${proj.quartersLeft} quarter${proj.quartersLeft===1?'':'s'} left — completes on Advance</div>
+    </div>`;
+  }
 
   if(studioSel){
     const s = SEGS.find(sg=>sg.id===studioSel.segId);
@@ -3992,6 +4142,7 @@ function doAdvance(){
       if(st.log[0]) st.log[0].html += ` <span style="color:var(--amber)">Test Track amplified your coupe halo (+${Math.round(extra*100)} brand).</span>`;
     }
     dramatizeEarlyLog(st);
+    completeStudioProject();   // tick the Studio project; a finished car rolls out if ready
     studioSel=null;
     recordValuation();   // reprice the company for real this quarter (ticker/sparkline)
     if(typeof MarqueWorld!=='undefined') MarqueWorld.setSimState(st);
@@ -4133,10 +4284,21 @@ function buildResultText(){
 }
 function copyResult(){
   const text = buildResultText();
-  navigator.clipboard.writeText(text).then(()=>{
-    const btn=document.getElementById('copyResultBtn');
-    if(btn){ btn.textContent='Copied!'; setTimeout(()=>{ btn.textContent='Copy result'; },2000); }
-  }).catch(()=>{ prompt('Copy this result:', text); });
+  const done = ()=>{ const btn=document.getElementById('copyResultBtn');
+    if(btn){ btn.textContent='Copied!'; setTimeout(()=>{ btn.textContent='Copy result'; },2000); } };
+  // no browser prompt: fall back to a legacy hidden-textarea copy, then a toast
+  const fallback = ()=>{
+    try{
+      const ta=document.createElement('textarea'); ta.value=text;
+      ta.style.position='fixed'; ta.style.opacity='0'; document.body.appendChild(ta);
+      ta.focus(); ta.select();
+      const ok=document.execCommand('copy'); document.body.removeChild(ta);
+      ok ? done() : toast('Could not copy automatically — select the result text to copy it.', 'error');
+    }catch(e){ toast('Could not copy automatically — select the result text to copy it.', 'error'); }
+  };
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(done).catch(fallback);
+  } else { fallback(); }
 }
 
 /* ── difficulty ─────────────────────────────────────────────────────────── */
