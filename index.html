@@ -228,22 +228,27 @@ function quoteDesign(st, segId, engId, trimId) {
   return { designCost, launchCost, total: designCost + launchCost, isNewSegment: launchCost > 0 };
 }
 
-function playerDesign(st, segId, engId, trimId, price) {
+// opts.prepaid: the cost was already charged elsewhere (a Studio project pays at
+// studioConfirm()), so skip the affordability check AND the deduction here — the
+// player is charged exactly once, at the earlier payment point. Default behaviour
+// (no opts) is unchanged: check cash, then deduct.
+function playerDesign(st, segId, engId, trimId, price, opts) {
   const player = st.companies.find(c=>c.player);
   const designCost = designCostOf(engId, trimId);
   const launchCost = segmentLaunchCostFor(player, segId);
   const total = designCost + launchCost;
-  if (player.cash < total) return { ok:false, reason:'Not enough cash.' };
+  const prepaid = !!(opts && opts.prepaid);
+  if (!prepaid && player.cash < total) return { ok:false, reason:'Not enough cash.' };
   const existing = player.models.find(m => m.segId===segId && m.active);
   if (existing) existing.active = false;
-  player.cash -= total;
+  if (!prepaid) player.cash -= total;
   if (!player.launchedSegs) player.launchedSegs = {};
   player.launchedSegs[segId] = true;
   const m = makeModel(segId, engId, trimId, 'player');
   if (price != null) m.price = price;
   player.models.push(m);
   applyRD(player); // boost new model with existing R&D
-  return { ok:true, cost: total, designCost, launchCost, model: m };
+  return { ok:true, cost: total, designCost, launchCost, model: m, prepaid };
 }
 
 function playerRefresh(st, segId, costOverride) {
@@ -1077,6 +1082,8 @@ const BS_COLORS_WORLD = { sedan:'#E8584B', suv:'#3F8EE0', pickup:'#46B97A', coup
 // post-advance production burst: counts down for 2.5s after triggerBurst()
 let burstT = 0;
 let burstMag = 1;   // burst intensity, scaled by how strong production was this quarter
+let pendingRollout = null;   // {segId,big} set by shell when a car rolls out; consumed by triggerBurst()
+let coachType = null;        // building type the first-run coach wants the player to use (pulsed on-map)
 
 // ── ambient campus agents (workers + forklift + finished cars) ────────────────
 // Density and motion scale with real sim output (units built, utilization): a
@@ -1354,7 +1361,9 @@ function drawBuildingAnimated(o){
 
     // read sim state once
     let player=null, hasRecall=false, isCapped=false, isStale=false, carColor='#377BF8';
+    let simTick=0;
     if(factorySimState){
+      simTick=factorySimState.tick||0;
       player=factorySimState.companies&&factorySimState.companies.find(c=>c.player);
       if(player){
         const active=player.models&&player.models.filter(x=>x.active)||[];
@@ -1365,6 +1374,9 @@ function drawBuildingAnimated(o){
         isCapped=(factorySimState.lastCapFill!=null&&factorySimState.lastCapFill<0.97);
       }
     }
+    // idle: has capacity but produced ~nothing this quarter (only after the first advance,
+    // so a brand-new plant that's about to run isn't mislabelled)
+    const isIdle = cap>0 && simTick>=1 && o.lastOutput < Math.max(1, cap*0.04) && !isCapped;
 
     // stale → desaturate car color to dusty amber
     const drawColor = isStale ? '#998870' : carColor;
@@ -1438,7 +1450,7 @@ function drawBuildingAnimated(o){
       ctx.fillText('FULL',lp.x,lp.y);
     }
 
-    // stale — dusty motes drifting upward from the roofline
+    // stale — dusty motes drifting upward from the roofline + a faded "AGING" badge
     if(isStale){
       for(let p=0;p<4;p++){
         const ph=(wT*0.32+p*0.25)%1;
@@ -1450,6 +1462,24 @@ function drawBuildingAnimated(o){
         ctx.beginPath(); ctx.arc(pp.x,pp.y,r,0,Math.PI*2); ctx.fill();
         ctx.globalAlpha=1;
       }
+      // faded badge so a stale model reads as a problem to fix, not just ambient dust
+      const ap=iso(o.x+d.w/2, o.y-0.12, lv.h+(isCapped?1.02:0.72));
+      ctx.save();
+      ctx.globalAlpha=0.78; ctx.fillStyle='#C0AF92'; ctx.textAlign='center';
+      ctx.font=`600 ${Math.round(8.5*effSc())}px Archivo,system-ui,sans-serif`;
+      ctx.fillText('AGING', ap.x, ap.y);
+      ctx.restore();
+    }
+
+    // idle — a quiet grey label above the roof; the belt/cars are already absent, so
+    // it just reads calm. Sits where FULL would (safe: idle excludes capped & stale).
+    if(isIdle && !isStale){
+      const ip=iso(o.x+d.w/2, o.y-0.12, lv.h+0.72);
+      ctx.save();
+      ctx.globalAlpha=0.6; ctx.fillStyle='#8A9099'; ctx.textAlign='center';
+      ctx.font=`500 ${Math.round(8.5*effSc())}px Archivo,system-ui,sans-serif`;
+      ctx.fillText('· idle ·', ip.x, ip.y);
+      ctx.restore();
     }
 
   } else if(o.type==='rdlab'){
@@ -1617,6 +1647,26 @@ function render(){
     if(it.kind==='b'){ drawBuilding(it.o); drawBuildingAnimated(it.o); }
     else if(it.kind==='a'){ drawAgent(it.a); }
     else { drawSmallCar(it.c.x, it.c.y, it.c.color); }
+  }
+
+  // first-run coach: a pulsing blue ring + chevron over the building we want clicked
+  if(coachType){
+    const t = campus.objects.find(o=>o.type===coachType);
+    if(t){
+      const td=def(t.type), th=td.levels[t.level].h;
+      const c=iso(t.x+td.w/2, t.y+td.d/2, th+0.15);
+      const pulse=0.5+0.5*Math.sin(wT*3.6), sc=effSc();
+      ctx.save();
+      ctx.strokeStyle=`rgba(55,123,248,${(0.35+pulse*0.5).toFixed(3)})`; ctx.lineWidth=2.6*sc;
+      ctx.beginPath(); ctx.arc(c.x,c.y,(20+pulse*10)*sc,0,Math.PI*2); ctx.stroke();
+      ctx.strokeStyle=`rgba(55,123,248,${(0.12+pulse*0.18).toFixed(3)})`; ctx.lineWidth=1.4*sc;
+      ctx.beginPath(); ctx.arc(c.x,c.y,(30+pulse*12)*sc,0,Math.PI*2); ctx.stroke();
+      const hp=iso(t.x+td.w/2, t.y, th+1.05+pulse*0.12);
+      ctx.fillStyle=`rgba(120,180,255,${(0.6+pulse*0.4).toFixed(3)})`; ctx.textAlign='center';
+      ctx.font=`700 ${Math.round(15*sc)}px Archivo,system-ui,sans-serif`;
+      ctx.fillText('▾', hp.x, hp.y);
+      ctx.restore();
+    }
   }
 
   // ghost building silhouette + a one-line hint (why-invalid)
@@ -1903,7 +1953,7 @@ let showExtraBuilds = false;
 function toggleExtraBuilds(){ showExtraBuilds=!showExtraBuilds; renderMenu(); }
 function buttonFor(type, cash){
   const d=def(type), cost=placeCostOf(type), can=cash>=cost, armed=buildType===type;
-  return `<button class="wbuild-btn${armed?' on':''}" ${(can||armed)?'':'disabled'}
+  return `<button class="wbuild-btn${armed?' on':''}" data-build="${type}" ${(can||armed)?'':'disabled'}
      onclick="MarqueWorld.toggleBuild('${type}')">
      ${armed?'✕ Cancel' : '+ '+d.name} <span>$${cost}M</span>
    </button>`;
@@ -2091,7 +2141,31 @@ function setLabFocus(id, focus){
 }
 
 // ── lifecycle ────────────────────────────────────────────────────────────────
-function triggerBurst(){ burstMag = 0.6 + simActivity().busy*1.6; burstT = 2.5; }   // stronger production → denser burst
+function triggerBurst(){
+  const roll = pendingRollout;
+  const base = 0.6 + simActivity().busy*1.6;
+  // a fresh car rolling out floods the lot harder and lingers longer than a normal quarter
+  burstMag = roll ? base + (roll.big ? 2.4 : 1.4) : base;
+  burstT   = roll ? 3.8 : 2.5;
+  if(roll){ spawnRolloutCars(roll.segId, roll.big ? 12 : 7); pendingRollout = null; }
+}
+// Shell flags a rollout right before triggerBurst() so the celebration is stronger.
+function flagRollout(segId, big){ pendingRollout = { segId: segId||null, big: !!big }; }
+// A guaranteed stream of finished cars leaving the plant in the new model's colour —
+// shown even if this quarter's production was small (the car hasn't sold yet; this is
+// the visible "it exists!" moment). Presentation only.
+function spawnRolloutCars(segId, n){
+  const plants = plantList(); if(!plants.length) return;
+  const color = BS_COLORS_WORLD[segId] || '#377BF8';
+  const gate = gatePoint();
+  for(let i=0;i<n;i++){
+    const p = plants[i % plants.length], pd = def(p.type);
+    cars.push({ type:'car', x:p.x+pd.w*0.5, y:p.y+pd.d*0.5,
+      tx:gate.x, ty:gate.y - 0.6 + Math.random()*1.2, color });
+  }
+}
+// First-run coach: pulse a ring over the building the tutorial points at (or clear it).
+function setCoachHint(type){ coachType = type || null; }
 
 function step(dt){
   wT += dt;
@@ -2156,6 +2230,8 @@ return {
   // new in rebuild
   setSimState, getSelectedBuildingScreenPos, triggerBurst, deselect, toggleExtraBuilds,
   selectBuilding,
+  // first-5-minutes pass: rollout celebration + on-map coach
+  flagRollout, setCoachHint,
   // presentation helpers exposed for headless tests
   developedTiles, simActivity,
 };
@@ -2646,9 +2722,28 @@ return {
   .tut-dismiss{background:none;border:none;color:var(--dimmer);cursor:pointer;
     font-size:14px;padding:0;line-height:1}
   .tut-dismiss:hover{color:var(--hi)}
-  .tut-item{display:flex;gap:7px;align-items:baseline;padding:2px 0;color:var(--dim)}
-  .tut-item.tut-done{color:var(--green)}
-  .tut-check{flex-shrink:0}
+  .coach-msg{color:var(--fg);font-size:11.5px;line-height:1.45}
+  .coach-msg b{color:var(--hi)}
+  /* pulse a DOM button (Advance / build buttons) the coach is pointing at */
+  .coach-pulse{position:relative;animation:coachpulse 1.25s ease-in-out infinite;
+    box-shadow:0 0 0 0 rgba(55,123,248,.55);border-color:var(--amber)!important;z-index:5}
+  @keyframes coachpulse{
+    0%{box-shadow:0 0 0 0 rgba(55,123,248,.5)}
+    70%{box-shadow:0 0 0 7px rgba(55,123,248,0)}
+    100%{box-shadow:0 0 0 0 rgba(55,123,248,0)}}
+  /* Task 4 — Cash gauge pulses red when cash is dangerously low */
+  .gauge.cash-danger{animation:cashpulse 1.1s ease-in-out infinite;border-radius:6px}
+  @keyframes cashpulse{
+    0%,100%{box-shadow:0 0 0 0 rgba(229,96,94,0)}
+    50%{box-shadow:0 0 0 3px rgba(229,96,94,.45)}}
+  /* Task 5 — expandable model history drawer */
+  .model-more{background:none;border:none;color:var(--dim);cursor:pointer;
+    font-family:var(--sans);font-size:10px;padding:3px 0;margin-top:2px;text-align:left}
+  .model-more:hover{color:var(--hi)}
+  .model-drawer{margin:4px 0 2px;padding:8px 10px;background:var(--panel2);
+    border:1px solid var(--line);border-radius:8px;font-size:10.5px}
+  .md-row{display:flex;justify-content:space-between;gap:10px;padding:2px 0;color:var(--dim)}
+  .md-row b{color:var(--hi);font-weight:600;text-align:right}
 </style>
 </head>
 <body>
@@ -3283,6 +3378,7 @@ function confirmLaunch(){
   }
   ensureNameplates(st);
   const newM = st.companies.find(c=>c.player).models.find(m=>m.segId===launchSel.segId&&m.active);
+  if(newM && !newM.launchYear){ newM.launchYear = st.year; newM.launchQ = st.quarter; }  // Task 5: model history
   const isHalo = newM && newM.segId==='coupe' && (newM.engId==='V8'||newM.engId==='V12');
   showFloater(isHalo ? `${newM.nameplate||'Coupe'} launched · halo brand boost active` : `${newM ? (newM.nameplate||launchSel.segId) : launchSel.segId} launched`, 'var(--green)');
   if(newM) showReviewCard(newM);
@@ -3295,8 +3391,8 @@ function confirmLaunch(){
 
 /* ── render ─────────────────────────────────────────────────────────────── */
 function render(){
-  updateTutorial();
-  if(st.launchFlow){ renderLaunchScreen(); return; }
+  if(st.launchFlow){ renderLaunchScreen(); clearCoach();
+    const tc=document.getElementById('tutCard'); if(tc) tc.style.display='none'; return; }
 
   const player = st.companies.find(c=>c.player);
   document.getElementById('clock').innerHTML = `Q<b>${st.quarter}</b> · ${st.year}`;
@@ -3305,9 +3401,11 @@ function render(){
   const ov = st.lastOverall*100;
   const showDelta = st.tick > 0;
   const dash = '<span class="dim">—</span>';
+  // Task 4: pulse the Cash gauge when cash is dangerously low so trouble is visible up top
+  const cashDanger = player.cash < 120;
   document.getElementById('cluster').innerHTML = `
-    <div class="gauge"><div class="lbl">Cash</div>
-      <div class="val">$${fmtM(player.cash)}</div>
+    <div class="gauge${cashDanger?' cash-danger':''}"><div class="lbl">Cash</div>
+      <div class="val"${cashDanger?' style="color:var(--red)"':''}>$${fmtM(player.cash)}</div>
       <div class="delta">${showDelta ? deltaHtml(player.cash,_lastCash,true) : dash}</div></div>
     <div class="gauge"><div class="lbl">Market Share</div>
       <div class="val">${ov.toFixed(1)}<small style="font-size:13px;color:var(--dim)">%</small></div>
@@ -3342,6 +3440,7 @@ function render(){
   if(typeof MarqueWorld!=='undefined') MarqueWorld.renderPanels();
   renderBroadcast();
   applyProgressiveDisclosure();
+  updateTutorial();   // last: the coach pulses buttons this render just (re)built
 }
 
 // RCT-style progressive disclosure: the first quarter shows only the car, the
@@ -3359,6 +3458,9 @@ function applyProgressiveDisclosure(){
 }
 
 /* ── segment cards ─────────────────────────────────────────────────────── */
+// Task 5 — which segment's model-history drawer is expanded (shell UI state, per-seg)
+let _modelDrawerOpen = {};
+function toggleModelDrawer(segId){ _modelDrawerOpen[segId] = !_modelDrawerOpen[segId]; renderSegments(); }
 function renderSegments(){
   const player = st.companies.find(c=>c.player);
   const wrap = document.getElementById('segments');
@@ -3415,6 +3517,26 @@ function renderSegments(){
       let carsHtml = '';
       for(let i=0;i<nCars;i++) carsHtml += carSVG('#377BF8');
       html += `<div class="cars" id="cars-${s.id}">${carsHtml}<span class="units">${units>0?units+'k units':''}</span></div>`;
+
+      /* Task 5 — expandable model history drawer (no new tab) */
+      const drawerOpen = !!_modelDrawerOpen[s.id];
+      html += `<button class="model-more" onclick="toggleModelDrawer('${s.id}')">${drawerOpen?'▾ Hide history':'▸ Model history'}</button>`;
+      if(drawerOpen){
+        const rc = buildReviewCard(pm);
+        const ly = pm.launchYear ? `Q${pm.launchQ} ${pm.launchYear}` : '—';
+        const life = pm.totalUnits>=1000 ? (pm.totalUnits/1000).toFixed(2)+'M' : Math.round(pm.totalUnits||0)+'k';
+        const best = pm.bestQ ? Math.round(pm.bestQ)+'k' : '—';
+        const status = pm.recallQ>0 ? '<b style="color:var(--red)">Under recall</b>'
+          : nov<35 ? '<b style="color:var(--amber)">Aging — refresh soon</b>'
+          : nov>60 ? '<b style="color:var(--green)">Fresh</b>' : '<b>In market</b>';
+        html += `<div class="model-drawer">
+          <div class="md-row"><span>Launched</span><b>${ly}</b></div>
+          <div class="md-row"><span>Lifetime sales</span><b>${life} units</b></div>
+          <div class="md-row"><span>Best quarter</span><b>${best}</b></div>
+          <div class="md-row"><span>Review</span><b>${rc.verdict}</b></div>
+          <div class="md-row"><span>Status</span>${status}</div>
+        </div>`;
+      }
 
       const refreshCost = refreshCostFor(s);
       const redesignBtn = studioHere
@@ -3932,8 +4054,8 @@ function refreshStudioPanel(){ if(typeof MarqueWorld!=='undefined') MarqueWorld.
 function projectQuarters(isRedesign){ return isRedesign ? 1 : 2; }
 function activeStudioProject(){ return st ? st.studioProject : null; }
 
-// Start a project instead of launching instantly. Cost is charged at completion
-// (playerDesign), so we verify affordability now and re-check when it rolls out.
+// Start a project instead of launching instantly. The cost is charged HERE, at project
+// start; completion uses playerDesign's prepaid path so it's never charged again.
 function studioConfirm(){
   if(!studioSel) return;
   if(st.studioProject){ toast('The Studio is already developing '+(st.studioProject.nameplate||'a car')+'.', 'error'); return; }
@@ -3945,9 +4067,11 @@ function studioConfirm(){
   const isRedesign = !!existing;
   const nameplate = (isRedesign && existing.nameplate) ? existing.nameplate : modelName(studioSel.segId, studioSel.engId);
   const qn = projectQuarters(isRedesign);
+  player.cash -= q.total;                     // Task 1: charge when the project STARTS
+  st._coachStudioDone = true;                 // Task 3: the "use the Studio" coaching step is satisfied
   st.studioProject = { segId:studioSel.segId, engId:studioSel.engId, trimId:studioSel.trimId,
-                       segName:s.name, nameplate, isRedesign, quartersLeft:qn, totalQuarters:qn };
-  showFloater(`${nameplate} — ${isRedesign?'redesign':'design'} started · ${qn}q in the Studio`, '#7C6FD6');
+                       segName:s.name, nameplate, isRedesign, quartersLeft:qn, totalQuarters:qn, paid:q.total };
+  showFloater(`${nameplate} — ${isRedesign?'redesign':'design'} started · $${q.total}M · ${qn}q`, '#7C6FD6');
   studioSel = null;
   if(typeof MarqueWorld!=='undefined') MarqueWorld.setSimState(st);   // badge appears immediately
   render();          // docked studio panel now shows the in-development project
@@ -3960,15 +4084,52 @@ function completeStudioProject(){
   if(!proj) return;
   proj.quartersLeft = Math.max(0, proj.quartersLeft - 1);
   if(proj.quartersLeft > 0) return;                 // still in development
-  const result = playerDesign(st, proj.segId, proj.engId, proj.trimId);
+  // Cost was already charged at studioConfirm() (project start). Complete via the
+  // prepaid path so playerDesign never re-charges or refunds — the project rolls out
+  // even if cash went negative in the interim. Charged exactly once, at the start.
+  const result = playerDesign(st, proj.segId, proj.engId, proj.trimId, null, { prepaid:true });
   if(!result.ok){ proj.quartersLeft = 1; toast(`${proj.nameplate}: ${result.reason} — held in the Studio.`, 'error'); return; }
   ensureNameplates(st);
   const dm = st.companies.find(c=>c.player).models.find(m=>m.segId===proj.segId&&m.active);
   if(dm) dm.nameplate = proj.nameplate;             // keep the name the badge showed
+  if(dm && !dm.launchYear){ dm.launchYear = st.year; dm.launchQ = st.quarter; }  // Task 5: model history
   const halo = dm && dm.segId==='coupe' && (dm.engId==='V8'||dm.engId==='V12');
+  const wasNew = !proj.isRedesign;
+  const segName = proj.segName || (dm ? getSeg(dm.segId).name : 'car');
   showFloater(halo ? `${proj.nameplate} rolls out · halo active` : `${proj.nameplate} rolls out of the Studio`, 'var(--green)');
+  // Task 2 — the first-launch moment: a headline + a clear next step in the advisor line.
+  if(st.log[0]){
+    st.log[0].html = (wasNew
+      ? `<b style="color:var(--green)">🚗 The ${proj.nameplate} rolls off the line!</b> Your new ${segName} is in showrooms.`
+      : `<b style="color:var(--green)">🔧 The ${proj.nameplate} is redesigned</b> — fresh sheetmetal back in showrooms.`)
+      + ' ' + st.log[0].html;
+    // Task 7 — personal rival reactions (presentation only) after a genuinely new model
+    if(wasNew){
+      st.log[0].html += ` <span style="color:var(--dim)">${rivalReactions(dm)}</span>`;
+    }
+    st.log[0].next = wasNew
+      ? `Your ${segName} is live. Advance to see how buyers respond — then set its price from the Studio if you need to.`
+      : `The refreshed ${segName} is back. Advance to see the sales bump.`;
+    st.log[0].nextRoute = null;
+  }
+  // Task 2 — a stronger, visible production burst / car rollout on the map
+  if(typeof MarqueWorld!=='undefined' && MarqueWorld.flagRollout) MarqueWorld.flagRollout(proj.segId, wasNew);
+  if(wasNew) setTimeout(()=>toast('Rivals are reacting to your launch.', 'ok'), 900);
   st.studioProject = null;
   if(dm) showReviewCard(dm);                        // non-blocking side card on completion
+}
+
+// Task 7 — presentation-only rival reactions after a major launch. Never touches sim
+// state; it names each rival's personality so the world feels like it's responding to you.
+function rivalReactions(dm){
+  const seg = dm ? getSeg(dm.segId).name : 'the segment';
+  const bits = [];
+  const has = id => st.companies.some(c=>c.id===id);
+  if(has('velo'))  bits.push('Velo trims prices to defend volume');
+  if(has('crown')) bits.push('Crownmark leans harder on its premium');
+  if(has('nuvo'))  bits.push('Nuvo answers with more performance');
+  if(!bits.length) return '';
+  return `Rivals react in ${seg}: ${bits.join(', ')}.`;
 }
 
 // The docked Studio panel body (rendered inside the studio building's inspector by
@@ -4142,6 +4303,10 @@ function doAdvance(){
       if(st.log[0]) st.log[0].html += ` <span style="color:var(--amber)">Test Track amplified your coupe halo (+${Math.round(extra*100)} brand).</span>`;
     }
     dramatizeEarlyLog(st);
+    // Task 5: track each model's best single quarter (shell-side; persisted in the save)
+    st.companies.find(c=>c.player).models.forEach(m=>{
+      if(m.active) m.bestQ = Math.max(m.bestQ||0, m.lastUnits||0);
+    });
     completeStudioProject();   // tick the Studio project; a finished car rolls out if ready
     studioSel=null;
     recordValuation();   // reprice the company for real this quarter (ticker/sparkline)
@@ -4223,39 +4388,65 @@ function renderEndScreen(){
 
 function keepBuilding(){ st.over = false; render(); saveGame(); }
 
-/* ── tutorial checklist ─────────────────────────────────────────────────── */
+/* ── first-run coach (Task 3) ────────────────────────────────────────────────
+   Replaces the text checklist with PHYSICAL guidance: one next step at a time,
+   pulsing the exact building or button to touch (Design Studio → Start Project →
+   Advance → Assembly → done). Nothing is forced; the ✕ dismisses it for good. */
 const TUTORIAL_KEY = 'marque.tutorial.v1';
-const TUTORIAL_STEPS = [
-  { label:'Design your founding car',
-    check: ()=> st && !st.launchFlow },
-  { label:'Place a Design Studio',
-    check: ()=> hasStudio() },
-  { label:'Build an R&D Lab',
-    check: ()=> typeof MarqueWorld!=='undefined' &&
-                MarqueWorld.getCampus().objects.some(o=>o.type==='rdlab') },
-  { label:'Advance your first quarter',
-    check: ()=> st && st.tick >= 1 },
-];
 function isTutDismissed(){ try{ return !!localStorage.getItem(TUTORIAL_KEY); }catch(e){ return false; } }
+
+// pulse (or clear) a single DOM element by selector — used for toolbar/Advance buttons
+let _coachDomSel = null;
+function setCoachDom(sel){
+  if(sel===_coachDomSel){
+    // re-assert in case render() rebuilt the element
+    if(sel){ const el=document.querySelector(sel); if(el && !el.classList.contains('coach-pulse')) el.classList.add('coach-pulse'); }
+    return;
+  }
+  document.querySelectorAll('.coach-pulse').forEach(e=>e.classList.remove('coach-pulse'));
+  _coachDomSel = sel;
+  if(sel){ const el=document.querySelector(sel); if(el) el.classList.add('coach-pulse'); }
+}
+function setCoachBuilding(type){ if(typeof MarqueWorld!=='undefined' && MarqueWorld.setCoachHint) MarqueWorld.setCoachHint(type||null); }
+function clearCoach(){ setCoachDom(null); setCoachBuilding(null); }
+
+// Decide the single next action. Returns {msg, dom, bld} or null when coaching is done.
+// Order respects progressive disclosure: the build menu is hidden until the first
+// Advance, so the first coached action is always Advance (which reveals the campus tools).
+function coachStep(){
+  if(!st || st.launchFlow || st.over) return null;
+  const capped = (st.lastCapFill!=null && st.lastCapFill<0.97) && st.tick>=1;
+  if(st.tick < 1)   // earlyGame: build menu is hidden — the only move is to run the quarter
+    return { msg:'<b>Advance the quarter</b> to put your car on sale and watch the market react.', dom:'#advBtn', bld:null };
+  if(!hasStudio())
+    return { msg:'Build a <b>Design Studio</b> — it’s where you design new cars.', dom:'.wbuild-btn[data-build="studio"]', bld:null };
+  if(!st.studioProject && !st._coachStudioDone)
+    return { msg:'Click the <b>Design Studio</b> on the map to develop your next car.', dom:null, bld:'studio' };
+  if(st.studioProject)
+    return { msg:'<b>Advance the quarter</b> — your car is being built in the Studio.', dom:'#advBtn', bld:null };
+  if(capped)
+    return { msg:'Your plant is <b>maxed out</b>. Upgrade it or add an <b>Assembly Plant</b>.', dom:'.wbuild-btn[data-build="assembly"]', bld:'assembly' };
+  return null;   // first loop complete — coaching done
+}
 function dismissTutorial(){
   try{ localStorage.setItem(TUTORIAL_KEY,'1'); }catch(e){}
+  clearCoach();
   const el=document.getElementById('tutCard');
   if(el){ el.classList.add('tut-fading'); setTimeout(()=>{ el.style.display='none'; el.classList.remove('tut-fading'); },380); }
 }
 function updateTutorial(){
-  if(isTutDismissed()) return;
+  if(isTutDismissed()){ clearCoach(); return; }
   const el=document.getElementById('tutCard');
   if(!el || !st) return;
-  if(st.over){ el.style.display='none'; return; }   // never clutter the end screen
-  const allDone = TUTORIAL_STEPS.every(s=>s.check());
-  if(allDone){ setTimeout(dismissTutorial, 1100); return; }
-  const items = TUTORIAL_STEPS.map(s=>{
-    const done=s.check();
-    return `<div class="tut-item${done?' tut-done':''}"><span class="tut-check">${done?'✓':'○'}</span>${s.label}</div>`;
-  }).join('');
+  if(st.over || st.launchFlow){ el.style.display='none'; clearCoach(); return; }
+  const step = coachStep();
+  if(!step){ el.style.display='none'; clearCoach(); return; }   // first loop done — quietly retire
   el.style.display='block';
-  el.innerHTML=`<div class="tut-head">Getting started
-    <button class="tut-dismiss" onclick="dismissTutorial()" title="Dismiss">✕</button></div>${items}`;
+  el.innerHTML=`<div class="tut-head">Next step
+    <button class="tut-dismiss" onclick="dismissTutorial()" title="Dismiss">✕</button></div>
+    <div class="coach-msg">${step.msg}</div>`;
+  setCoachDom(step.dom);
+  setCoachBuilding(step.bld);
 }
 
 /* ── end-of-run result card ─────────────────────────────────────────────── */
