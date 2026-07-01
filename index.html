@@ -902,7 +902,7 @@ window.MarqueWorld = (() => {
 'use strict';
 
 // ── grid + catalog ───────────────────────────────────────────────────────────
-const GRID_W = 14, GRID_D = 10;     // tiles — roomy campus that sprawls over the years
+const GRID_W = 30, GRID_D = 20;     // tiles — a large lot the campus grows into over the years
 const BASE_CAPACITY = 60;           // k units/q with no plants (a starter line)
 
 const CATALOG = {
@@ -967,7 +967,9 @@ function freshCampus(){
   // BASE_CAPACITY + 120 = 180k — exactly the sim's old capacityStart, keeping the
   // balance intact. The founding plant is free (it's the plant you start with).
   const campus = { objects:[], selectedId:null, cashSpentOnCampus:0, nextId:1 };
-  campus.objects.push({ id:campus.nextId++, type:'assembly', x:1, y:2, level:1,
+  // Founding plant sits near the middle of the lot so there's open land to grow into
+  // on every side. Camera frames this on first load.
+  campus.objects.push({ id:campus.nextId++, type:'assembly', x:13, y:8, level:1,
                         state:'operating', lastOutput:0 });
   return campus;
 }
@@ -1106,23 +1108,33 @@ function resize(){
   cv.width = W*DPR; cv.height = H*DPR;
   ctx.setTransform(DPR,0,0,DPR,0,0);
 }
+// Centroid of the built campus (tile coords), so the camera frames what the player
+// has, with open land visible around it. Falls back to the grid centre.
+function campusCenter(){
+  const objs = campus.objects;
+  if(!objs || !objs.length) return { x:GRID_W/2, y:GRID_D/2 };
+  let sx=0, sy=0;
+  objs.forEach(o=>{ const d=def(o.type); sx += o.x + d.w/2; sy += o.y + d.d/2; });
+  return { x:sx/objs.length, y:sy/objs.length };
+}
 function fit(){
-  // Frame the whole iso grid. In screen space, (x-y) spans [-GRID_D, GRID_W] and
-  // (x+y) spans [0, GRID_W+GRID_D]; compute the scale that fits both with margins,
-  // then centre the grid's midpoint, so framing stays sensible at any grid size.
-  const toolbarH = 96;   // build-menu band overlaps the canvas bottom — keep clear
-  const topH = 34;       // live ticker band along the top — keep clear
-  const gridWpx = (GRID_W + GRID_D) * (TW / 2);   // screen width span at scale 1
-  const gridHpx = (GRID_W + GRID_D) * (TH / 2);   // screen height span at scale 1
-  const availW = W * 0.94;
-  const availH = (H - toolbarH - topH) * 0.94;
-  view.sc = clamp(Math.min(availW / gridWpx, availH / gridHpx), 0.35, 1.5);
+  // Instead of squeezing the whole 30×20 lot on screen (which makes it tiny), frame a
+  // ~SPAN-tile window centred on the campus. The campus reads large and there's open
+  // land on every side to build into. User pan/zoom layer on top (panX/panY, zoom).
+  const toolbarH = 70;   // compact build strip along the bottom — keep clear
+  const topH = 12;
+  const SPAN = 24;       // tiles across the framed window (diagonal span)
+  const spanWpx = SPAN * (TW / 2);
+  const spanHpx = SPAN * (TH / 2);
+  const availW = W * 0.98;
+  const availH = (H - toolbarH - topH) * 0.98;
+  view.sc = clamp(Math.min(availW / spanWpx, availH / spanHpx), 0.45, 3.0);
   const sc = effSc();
-  // centre (x-y) midpoint = (GRID_W-GRID_D)/2 at W/2
-  view.ox = Math.round(W * 0.5 - (GRID_W - GRID_D) * (TW / 4) * sc);
-  // centre (x+y) midpoint vertically in the band between ticker and toolbar
-  const gridH = (GRID_W + GRID_D) * (TH / 2) * sc;
-  view.oy = Math.max(topH, Math.round(topH + (H - toolbarH - topH - gridH) / 2));
+  const c = campusCenter();
+  // put the campus centroid at the horizontal centre and the vertical band centre
+  view.ox = Math.round(W * 0.5 - (c.x - c.y) * (TW / 2) * sc);
+  const bandCenterY = topH + (H - toolbarH - topH) / 2;
+  view.oy = Math.round(bandCenterY - (c.x + c.y) * (TH / 2) * sc);
 }
 function iso(x,y,z){
   const sc = effSc();
@@ -1152,10 +1164,11 @@ function tile(x,y,fill,stroke){
 }
 function prism(x,y,w,d,h,col,opt){
   opt=opt||{};
+  const z0=opt.z0||0;                                   // raised base (rooftop boxes etc.)
   const top=opt.top||col, right=opt.right||shade(col,-24), left=opt.left||shade(col,-48);
   let A,B,C,D;
-  A=iso(x+w,y,0); B=iso(x+w,y+d,0); C=iso(x+w,y+d,h); D=iso(x+w,y,h); ctx.fillStyle=right; quad(A,B,C,D);
-  A=iso(x,y+d,0); B=iso(x+w,y+d,0); C=iso(x+w,y+d,h); D=iso(x,y+d,h); ctx.fillStyle=left; quad(A,B,C,D);
+  A=iso(x+w,y,z0); B=iso(x+w,y+d,z0); C=iso(x+w,y+d,h); D=iso(x+w,y,h); ctx.fillStyle=right; quad(A,B,C,D);
+  A=iso(x,y+d,z0); B=iso(x+w,y+d,z0); C=iso(x+w,y+d,h); D=iso(x,y+d,h); ctx.fillStyle=left; quad(A,B,C,D);
   A=iso(x,y,h); B=iso(x+w,y,h); C=iso(x+w,y+d,h); D=iso(x,y+d,h); ctx.fillStyle=top; quad(A,B,C,D);
   if(opt.outline){ ctx.strokeStyle=opt.outline; ctx.lineWidth=opt.outlineW||1.4; ctx.stroke(); }
 }
@@ -1358,6 +1371,9 @@ function drawBuildingAnimated(o){
     const cap=capacityOf(o);
     const util=cap>0?Math.min(o.lastOutput/cap,1):0;
     const beltD=o.y+d.d*0.42, beltH=lv.h*0.82;
+    // When a real plant sprite is drawn, skip the procedural on-roof conveyor belt (it
+    // would overlay the art). Status overlays + ground rollout cars still convey activity.
+    const hasSprite = !!buildingSprite(o);
 
     // read sim state once
     let player=null, hasRecall=false, isCapped=false, isStale=false, carColor='#377BF8';
@@ -1386,7 +1402,7 @@ function drawBuildingAnimated(o){
     const burstAlpha = inBurst ? Math.min(1, burstT) : 0;
     const drawUtil = inBurst ? Math.max(util, 0.18 + burstAlpha * 0.5) : util;
 
-    if(drawUtil>0){
+    if(drawUtil>0 && !hasSprite){
       // conveyor belt
       const bl=iso(o.x+0.22,beltD,beltH), br=iso(o.x+d.w-0.22,beltD,beltH);
       ctx.strokeStyle='rgba(80,90,105,0.65)'; ctx.lineWidth=2.2*effSc();
@@ -1591,21 +1607,21 @@ function render(){
   if(!ctx) return;
   if(buildType && mouseInside) computeGhost(mouseSX, mouseSY);   // keep the ghost live
   ctx.clearRect(0,0,W,H);
-  // sky/ground backdrop
+  // daylight sky backdrop — hazy industrial-park blue fading to a bright horizon
   const g=ctx.createLinearGradient(0,0,0,H);
-  g.addColorStop(0,'#0e1320'); g.addColorStop(1,'#141b2b');
+  g.addColorStop(0,'#A9C0D4'); g.addColorStop(0.55,'#C3D0DA'); g.addColorStop(1,'#D8DFE3');
   ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
 
-  // ground tiles — developed (paved campus) tiles spread around buildings, so the
-  // site visibly grows from a lone startup plot into a sprawling industrial campus.
+  // ground tiles — developed lots read as light concrete/asphalt; undeveloped land is
+  // a muted green-gray so the campus visibly grows from open ground into a paved site.
   const dev = developedTiles();
   for(let x=0;x<GRID_W;x++) for(let y=0;y<GRID_D;y++){
     if(dev.has(x+','+y)){
-      const lot = (x+y)%2===0 ? '#283142' : '#2d3749';   // paved campus lot
-      tile(x,y,lot,'rgba(255,255,255,.05)');
+      const lot = (x+y)%2===0 ? '#C6CBD0' : '#BCC1C7';   // concrete apron
+      tile(x,y,lot,'rgba(40,52,66,.10)');
     } else {
-      const raw = (x+y)%2===0 ? '#212c3e' : '#263247';   // undeveloped ground (room to grow)
-      tile(x,y,raw,'rgba(255,255,255,.035)');
+      const raw = (x+y)%2===0 ? '#97A48D' : '#8E9C84';   // undeveloped green-gray land
+      tile(x,y,raw,'rgba(40,52,66,.06)');
     }
   }
 
@@ -1636,6 +1652,22 @@ function render(){
   // finished-goods lot on the apron (under buildings/agents so cars sit on the ground)
   drawParkedCars();
 
+  // first-run coach — ground halo UNDER the target building (reads at any sprite height)
+  if(coachType){
+    const t = campus.objects.find(o=>o.type===coachType);
+    if(t){
+      const td=def(t.type), c=iso(t.x+td.w/2, t.y+td.d/2, 0);
+      const pulse=0.5+0.5*Math.sin(wT*3.6), sc=effSc();
+      const rx=(td.w+td.d)*(TW/2)*sc*0.5*(1+pulse*0.04);
+      ctx.save();
+      ctx.strokeStyle=`rgba(47,107,224,${(0.42+pulse*0.45).toFixed(3)})`; ctx.lineWidth=3*sc;
+      ctx.beginPath(); ctx.ellipse(c.x,c.y,rx,rx*0.5,0,0,Math.PI*2); ctx.stroke();
+      ctx.strokeStyle=`rgba(47,107,224,${(0.14+pulse*0.16).toFixed(3)})`; ctx.lineWidth=1.6*sc;
+      ctx.beginPath(); ctx.ellipse(c.x,c.y,rx+9*sc,(rx+9*sc)*0.5,0,0,Math.PI*2); ctx.stroke();
+      ctx.restore();
+    }
+  }
+
   // buildings + agents + driving cars, depth-sorted together so nearer things overlap
   const drawList = [];
   // the building being moved is "picked up" — hide it at its origin; the ghost shows it
@@ -1649,21 +1681,17 @@ function render(){
     else { drawSmallCar(it.c.x, it.c.y, it.c.color); }
   }
 
-  // first-run coach: a pulsing blue ring + chevron over the building we want clicked
+  // first-run coach — bobbing chevron ABOVE the target building (the ground halo is
+  // drawn earlier, under the building). Together they point at it at any sprite height.
   if(coachType){
     const t = campus.objects.find(o=>o.type===coachType);
     if(t){
-      const td=def(t.type), th=td.levels[t.level].h;
-      const c=iso(t.x+td.w/2, t.y+td.d/2, th+0.15);
-      const pulse=0.5+0.5*Math.sin(wT*3.6), sc=effSc();
+      const td=def(t.type), th=td.levels[t.level].h, sc=effSc();
+      const pulse=0.5+0.5*Math.sin(wT*3.6);
+      const hp=iso(t.x+td.w/2, t.y, th+1.15+pulse*0.18);
       ctx.save();
-      ctx.strokeStyle=`rgba(55,123,248,${(0.35+pulse*0.5).toFixed(3)})`; ctx.lineWidth=2.6*sc;
-      ctx.beginPath(); ctx.arc(c.x,c.y,(20+pulse*10)*sc,0,Math.PI*2); ctx.stroke();
-      ctx.strokeStyle=`rgba(55,123,248,${(0.12+pulse*0.18).toFixed(3)})`; ctx.lineWidth=1.4*sc;
-      ctx.beginPath(); ctx.arc(c.x,c.y,(30+pulse*12)*sc,0,Math.PI*2); ctx.stroke();
-      const hp=iso(t.x+td.w/2, t.y, th+1.05+pulse*0.12);
-      ctx.fillStyle=`rgba(120,180,255,${(0.6+pulse*0.4).toFixed(3)})`; ctx.textAlign='center';
-      ctx.font=`700 ${Math.round(15*sc)}px Archivo,system-ui,sans-serif`;
+      ctx.fillStyle=`rgba(47,107,224,${(0.7+pulse*0.3).toFixed(3)})`; ctx.textAlign='center';
+      ctx.font=`700 ${Math.round(17*sc)}px Archivo,system-ui,sans-serif`;
       ctx.fillText('▾', hp.x, hp.y);
       ctx.restore();
     }
@@ -1681,33 +1709,170 @@ function render(){
   }
 }
 
-function drawBuilding(o){
-  const d=def(o.type), lv=d.levels[o.level];
-  const selected = campus.selectedId===o.id, hover = hoverId===o.id;
-  const base = d.color;
-  const col = selected ? shade(base,28) : (hover ? shade(base,14) : base);
-  // pad slightly inside the footprint so tiles read as a lot
-  prism(o.x+0.08, o.y+0.08, d.w-0.16, d.d-0.16, lv.h, col,
-    { outline: selected?'#377BF8':'rgba(0,0,0,.25)', outlineW: selected?2.4:1 });
-  // roof detail: a sawtooth stripe + level pips
-  const rz=lv.h;
-  ctx.fillStyle=shade(col,-10);
-  for(let s=o.x+0.4; s<o.x+d.w-0.2; s+=0.7){
-    const a=iso(s,o.y+0.2,rz), b=iso(s+0.18,o.y+0.2,rz), c=iso(s+0.18,o.y+d.d-0.2,rz), e=iso(s,o.y+d.d-0.2,rz);
-    quad(a,b,c,e);
+// ── building assets (future sprites) with procedural fallback ────────────────
+// A manifest of per-type/per-level art. Files don't have to exist yet — the loader
+// records misses and drawBuilding falls back to the procedural renderer. Dropping a
+// real assets/buildings/*.svg in later automatically replaces the procedural drawing.
+const ASSET_BASE = 'assets/buildings/';
+const ASSET_MANIFEST = {
+  'assembly-l1':'assembly-l1.svg', 'assembly-l2':'assembly-l2.svg',
+  'studio-l1':'studio-l1.svg',     'studio-l2':'studio-l2.svg',
+  'rdlab-l1':'rdlab-l1.svg',       'rdlab-l2':'rdlab-l2.svg',
+};
+const _assets = {};   // key -> { img, state:'loading'|'ready'|'missing' }
+function assetKeyFor(o){ return o.type+'-l'+o.level; }
+function loadAsset(key){
+  if(_assets[key] || !ASSET_MANIFEST[key]) return;
+  const rec = { img:new Image(), state:'loading' };
+  _assets[key] = rec;
+  rec.img.onload  = ()=>{ rec.state = (rec.img.width>0) ? 'ready' : 'missing'; };
+  rec.img.onerror = ()=>{ rec.state = 'missing'; };
+  rec.img.src = ASSET_BASE + ASSET_MANIFEST[key];
+}
+function preloadAssets(){ Object.keys(ASSET_MANIFEST).forEach(loadAsset); }
+// a ready sprite for this building, or null → procedural fallback
+function buildingSprite(o){
+  const key = assetKeyFor(o); const rec = _assets[key];
+  if(!rec){ if(ASSET_MANIFEST[key]) loadAsset(key); return null; }
+  return rec.state==='ready' ? rec.img : null;
+}
+
+// shared steel/concrete/glass material palette (daylight)
+const MAT = { top:'#E0E4E7', right:'#C4C9CE', left:'#ABB1B8',
+              roof:'#CDD1D5', dark:'#6B7480', glass:'#A9C4D6', glassLit:'#CFE0EC' };
+
+// footprint edge polygon (ground) — for the sprite-mode selection/hover ring
+function footprintPath(o){ const d=def(o.type);
+  const a=iso(o.x,o.y,0),b=iso(o.x+d.w,o.y,0),c=iso(o.x+d.w,o.y+d.d,0),e=iso(o.x,o.y+d.d,0);
+  ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.lineTo(c.x,c.y);ctx.lineTo(e.x,e.y);ctx.closePath();
+}
+// fill a rectangular panel on a visible wall face (doors, glass, bays)
+// face 'x' = the +x wall (u runs along y); face 'y' = the +y wall (u runs along x)
+function facePanel(o, face, u0, u1, z0, z1, fill){
+  const d=def(o.type); let A,B,C,D;
+  if(face==='x'){ const X=o.x+d.w;
+    A=iso(X,o.y+u0,z0); B=iso(X,o.y+u1,z0); C=iso(X,o.y+u1,z1); D=iso(X,o.y+u0,z1);
+  } else { const Y=o.y+d.d;
+    A=iso(o.x+u0,Y,z0); B=iso(o.x+u1,Y,z0); C=iso(o.x+u1,Y,z1); D=iso(o.x+u0,Y,z1);
   }
-  // label
+  ctx.fillStyle=fill; quad(A,B,C,D);
+}
+// accent trim line along the two front eaves
+function roofTrim(o,h,acc){
+  const d=def(o.type); ctx.strokeStyle=acc; ctx.lineWidth=2.0*effSc();
+  let A=iso(o.x+0.1,o.y+d.d-0.1,h),B=iso(o.x+d.w-0.1,o.y+d.d-0.1,h);
+  ctx.beginPath();ctx.moveTo(A.x,A.y);ctx.lineTo(B.x,B.y);ctx.stroke();
+  A=iso(o.x+d.w-0.1,o.y+0.1,h);B=iso(o.x+d.w-0.1,o.y+d.d-0.1,h);
+  ctx.beginPath();ctx.moveTo(A.x,A.y);ctx.lineTo(B.x,B.y);ctx.stroke();
+}
+
+function drawBuilding(o){
+  const selected = campus.selectedId===o.id, hover = hoverId===o.id;
+  const sprite = buildingSprite(o);
+  if(sprite){
+    const d=def(o.type);
+    // selection/hover ring on the GROUND footprint — independent of the art, so it
+    // stays exact regardless of the sprite's silhouette (hit-detection is tile-based).
+    if(selected||hover){ footprintPath(o); ctx.strokeStyle=selected?'#2E6BE0':'rgba(46,107,224,.45)'; ctx.lineWidth=(selected?2.6:1.4)*effSc(); ctx.stroke(); }
+    // Sprite contract: the SVG's footprint diamond centre sits at (VW/2, VH-VW/4) in
+    // its own viewBox. Align that point to the footprint centre on the ground so the
+    // art lands on the tiles at any zoom; the building rises above.
+    const c   = iso(o.x+d.w/2, o.y+d.d/2, 0);
+    const wpx = (d.w+d.d)*(TW/2)*effSc()*1.02;
+    const vh  = wpx*(sprite.height/sprite.width || 0.85);
+    ctx.drawImage(sprite, c.x - wpx/2, c.y - vh + wpx/4, wpx, vh);
+  } else {
+    drawBuildingProcedural(o, selected, hover);
+  }
+  drawBuildingLabel(o, selected);
+}
+
+function drawBuildingProcedural(o, selected, hover){
+  const d=def(o.type), lv=d.levels[o.level], h=lv.h, acc=d.color;
+  if(o.type==='testtrack'){ drawTestTrackGround(o, selected, hover); return; }
+  const sc=effSc();
+  const lift = selected?10:hover?5:0;
+  // main volume — concrete/steel material, not a saturated block
+  prism(o.x+0.12, o.y+0.12, d.w-0.24, d.d-0.24, h, MAT.top,
+    { top:shade(MAT.top,lift), right:shade(MAT.right,lift), left:shade(MAT.left,lift),
+      outline: selected?'#2E6BE0':'rgba(40,52,66,.35)', outlineW: selected?2.6:1 });
+
+  if(o.type==='assembly'){
+    // sawtooth north-light roof
+    ctx.fillStyle=shade(MAT.glass,-6);
+    for(let s=o.x+0.5; s<o.x+d.w-0.35; s+=0.62){
+      const a=iso(s,o.y+0.25,h),b=iso(s+0.30,o.y+0.25,h),c=iso(s+0.30,o.y+d.d-0.25,h),e=iso(s,o.y+d.d-0.25,h);
+      quad(a,b,c,e);
+    }
+    // roof vents (raised boxes)
+    prism(o.x+0.9, o.y+0.5, 0.5,0.5, h+0.28, MAT.dark, {z0:h});
+    prism(o.x+d.w-1.4, o.y+d.d-1.0, 0.5,0.5, h+0.24, MAT.dark, {z0:h});
+    // loading-bay doors on the +y (long front) face
+    for(let i=0;i<3;i++){ const u=0.55+i*1.05; facePanel(o,'y',u,u+0.7,0.05,0.55,'#4A525C'); }
+    // factory gate on the +x face + an accent output lane on the apron toward the gate
+    facePanel(o,'x',0.6,1.6,0.05,0.7, acc);
+    ctx.strokeStyle=acc; ctx.lineWidth=3.2*sc; ctx.globalAlpha=0.55;
+    let g0=iso(o.x+d.w,o.y+d.d*0.5,0.02), g1=iso(o.x+d.w+1.4,o.y+d.d*0.5,0.02);
+    ctx.beginPath();ctx.moveTo(g0.x,g0.y);ctx.lineTo(g1.x,g1.y);ctx.stroke(); ctx.globalAlpha=1;
+  } else if(o.type==='studio'){
+    // clean glass front on the +y face + a garage bay on the +x face
+    facePanel(o,'y',0.25,d.w-0.25,0.1,h*0.92, MAT.glass);
+    facePanel(o,'y',0.25,d.w-0.25,h*0.5,h*0.55, shade(MAT.glass,20)); // mullion glint
+    facePanel(o,'x',0.5,1.5,0.05,0.75,'#4A525C');                     // clay-model garage bay
+    // rooftop skylight strip + accent trim
+    ctx.fillStyle=MAT.glassLit;
+    const a=iso(o.x+0.5,o.y+0.4,h),b=iso(o.x+d.w-0.5,o.y+0.4,h),c=iso(o.x+d.w-0.5,o.y+0.9,h),e=iso(o.x+0.5,o.y+0.9,h); quad(a,b,c,e);
+  } else if(o.type==='rdlab'){
+    // technical rooftop units + a test-garage door + antenna
+    prism(o.x+0.5,o.y+0.4,0.6,0.5,h+0.22,MAT.dark,{z0:h});
+    prism(o.x+d.w-1.1,o.y+0.4,0.4,0.4,h+0.16,shade(MAT.dark,20),{z0:h});
+    facePanel(o,'y',0.4,1.5,0.05,0.6,'#3F86A0');    // teal-tinted test-garage door
+    facePanel(o,'y',d.w-1.4,d.w-0.4,0.1,h*0.8, MAT.glass);
+    const base=iso(o.x+d.w-0.7,o.y+d.d-0.6,h), tip=iso(o.x+d.w-0.7,o.y+d.d-0.6,h+0.9);
+    ctx.strokeStyle=MAT.dark; ctx.lineWidth=1.4*sc; ctx.beginPath();ctx.moveTo(base.x,base.y);ctx.lineTo(tip.x,tip.y);ctx.stroke();
+    ctx.fillStyle=acc; ctx.beginPath();ctx.arc(tip.x,tip.y,2.2*sc,0,Math.PI*2);ctx.fill();
+  } else if(o.type==='qualitycenter'){
+    // an open inspection bay with a little car silhouette inside
+    facePanel(o,'y',0.3,d.w-0.3,0.05,h*0.78,'#3A424C');
+    ctx.fillStyle=acc; const cx=o.x+d.w/2;
+    const ca=iso(cx-0.35,o.y+d.d,0.12),cb=iso(cx+0.35,o.y+d.d,0.12),cc=iso(cx+0.35,o.y+d.d,0.4),cd=iso(cx-0.35,o.y+d.d,0.4); quad(ca,cb,cc,cd);
+    prism(o.x+d.w-0.7,o.y+0.4,0.4,0.4,h+0.18,MAT.dark,{z0:h});
+  }
+  roofTrim(o,h,acc);
+}
+
+// Test Track reads as land: an asphalt oval on the ground with an infield, not a block.
+function drawTestTrackGround(o, selected, hover){
+  const d=def(o.type), acc=d.color;
+  // paved pad
+  const a=iso(o.x+0.1,o.y+0.1,0),b=iso(o.x+d.w-0.1,o.y+0.1,0),c=iso(o.x+d.w-0.1,o.y+d.d-0.1,0),e=iso(o.x+0.1,o.y+d.d-0.1,0);
+  ctx.fillStyle= selected?'#3C4650':'#39424C'; ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.lineTo(c.x,c.y);ctx.lineTo(e.x,e.y);ctx.closePath();ctx.fill();
+  if(selected||hover){ ctx.strokeStyle=selected?'#2E6BE0':'rgba(46,107,224,.45)'; ctx.lineWidth=(selected?2.6:1.4)*effSc(); ctx.stroke(); }
+  // infield (grass) + track lane markings as an inset oval ring
+  const inA=iso(o.x+0.8,o.y+0.55,0),inB=iso(o.x+d.w-0.8,o.y+0.55,0),inC=iso(o.x+d.w-0.8,o.y+d.d-0.55,0),inD=iso(o.x+0.8,o.y+d.d-0.55,0);
+  ctx.fillStyle='#7E8C77'; ctx.beginPath();ctx.moveTo(inA.x,inA.y);ctx.lineTo(inB.x,inB.y);ctx.lineTo(inC.x,inC.y);ctx.lineTo(inD.x,inD.y);ctx.closePath();ctx.fill();
+  // center dashed lane line following the oval
+  ctx.strokeStyle='rgba(240,220,180,.6)'; ctx.setLineDash([5*effSc(),5*effSc()]); ctx.lineWidth=1.4*effSc();
+  const m0=iso(o.x+0.45,o.y+d.d/2,0.02),m1=iso(o.x+d.w-0.45,o.y+d.d/2,0.02);
+  ctx.beginPath();ctx.moveTo(m0.x,m0.y);ctx.lineTo(m1.x,m1.y);ctx.stroke(); ctx.setLineDash([]);
+}
+
+function drawBuildingLabel(o, selected){
+  const d=def(o.type), lv=d.levels[o.level], rz=lv.h;
   const p=iso(o.x+d.w/2, o.y+d.d/2, rz+0.5);
-  ctx.fillStyle = selected?'#377BF8':'#cdd3db';
+  // legible on a light scene: dark text with a soft halo
   ctx.font=`600 ${11*effSc()}px Archivo,system-ui,sans-serif`; ctx.textAlign='center';
+  ctx.lineWidth=3*effSc(); ctx.strokeStyle='rgba(245,248,250,.85)';
+  ctx.strokeText(`${d.name.split(' ')[0]} L${o.level}`, p.x, p.y);
+  ctx.fillStyle = selected?'#2E6BE0':'#2A3038';
   ctx.fillText(`${d.name.split(' ')[0]} L${o.level}`, p.x, p.y);
   // utilization bar floating above when operating
   const cap=capacityOf(o);
   if(cap>0){
     const util=clamp(o.lastOutput/cap,0,1);
     const bw=34*effSc(), bx=p.x-bw/2, by=p.y+5*effSc();
-    ctx.fillStyle='rgba(0,0,0,.45)'; ctx.fillRect(bx,by,bw,4*effSc());
-    ctx.fillStyle = util>0.92?'#E5605E':'#4FD08A'; ctx.fillRect(bx,by,bw*util,4*effSc());
+    ctx.fillStyle='rgba(30,40,52,.35)'; ctx.fillRect(bx,by,bw,4*effSc());
+    ctx.fillStyle = util>0.92?'#E5605E':'#3FA76A'; ctx.fillRect(bx,by,bw*util,4*effSc());
   }
 }
 
@@ -1839,7 +2004,7 @@ function onWheel(ev){
   if(!cv) return;
   ev.preventDefault();
   const pos=relPos(ev), mx=pos.x, my=pos.y;
-  const target = clamp(zoom * (ev.deltaY < 0 ? 1.12 : 0.89), 0.6, 2.4);
+  const target = clamp(zoom * (ev.deltaY < 0 ? 1.12 : 0.89), 0.5, 3.4);
   const k = target / zoom;
   panX = (mx - (mx - effOx())*k) - view.ox;
   panY = (my - (my - effOy())*k) - view.oy;
@@ -2183,6 +2348,7 @@ function loop(now){
 
 function init(canvasEl, options){
   opts = options||{};
+  preloadAssets();     // kick off sprite loads; procedural fallback until they arrive
   if(canvasEl){
     cv=canvasEl; ctx=cv.getContext('2d');
     resize(); fit();
@@ -2240,42 +2406,49 @@ return {
 </script>
 <style>
   :root{
-    --bg:#15171C; --panel:#1D2026; --panel2:#22262E; --line:#2E333D;
-    --hi:#ECEEF1; --fg:#ECEEF1; --dim:#8A9099; --dimmer:#5C636E;
-    --amber:#377BF8; --green:#4FD08A; --red:#E5605E;   /* --amber holds Motor1 brand blue #377BF8 (restyle S9) */
+    /* Daylight industrial palette (Visual Reboot). Light concrete surfaces, dark ink,
+       Motor1 blue as a restrained accent. --amber holds the brand blue #377BF8. */
+    --bg:#E7EBEE; --panel:#FFFFFF; --panel2:#F2F4F6; --line:#D3D8DE;
+    --hi:#1D242B; --fg:#232A31; --dim:#5B646E; --dimmer:#98A0A9;
+    --amber:#2F6BE0; --green:#2E9E63; --red:#D64B49;
     --mono:'IBM Plex Mono',ui-monospace,monospace;
     --sans:'Archivo',system-ui,sans-serif;
   }
   *{box-sizing:border-box}
   html,body{margin:0;background:var(--bg);color:var(--hi);font-family:var(--sans);font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased}
-  body{padding:18px;max-width:1200px;margin:0 auto;height:100vh;display:flex;flex-direction:column}
+  body{margin:0;width:100vw;height:100dvh;overflow:hidden;display:flex;flex-direction:column}
   .mono{font-family:var(--sans)}
   .dim{color:var(--dim)} .up{color:var(--green)} .down{color:var(--red)}
 
-  /* ── header ── */
-  header{flex:0 0 auto;display:flex;flex-wrap:wrap;align-items:flex-end;gap:16px;
-    border-bottom:1px solid var(--line);padding-bottom:14px;margin-bottom:14px}
-  .brandmark{display:flex;flex-direction:column;gap:2px;margin-right:auto}
-  .brandmark .nm{font-weight:800;font-size:26px;letter-spacing:.06em;text-transform:uppercase;line-height:1}
+  /* ── thin top bar ── */
+  header{flex:0 0 auto;display:flex;align-items:center;gap:14px;height:46px;padding:0 14px;
+    background:var(--panel);border-bottom:1px solid var(--line);
+    box-shadow:0 1px 3px rgba(30,40,52,.06);z-index:40}
+  .brandmark{display:flex;align-items:baseline;gap:8px}
+  .brandmark .nm{font-weight:800;font-size:18px;letter-spacing:.05em;text-transform:uppercase;line-height:1}
   .brandmark .nm .dot{color:var(--amber)}
-  .brandmark .sub{font-family:var(--sans);font-size:11px;color:var(--dim);letter-spacing:.18em;text-transform:uppercase}
-  .clock{font-family:var(--sans);font-size:13px;color:var(--dim);
-    border:1px solid var(--line);border-radius:6px;padding:6px 10px;letter-spacing:.1em}
-  .clock b{color:var(--amber);font-weight:600}
-  .run-ctl{display:flex;gap:6px}
-  .run-ctl button{font-family:var(--sans);font-size:11px;letter-spacing:.04em;
+  .brandmark .sub{display:none}
+  .clock{font-family:var(--sans);font-size:12px;color:var(--dim);
+    border:1px solid var(--line);border-radius:6px;padding:4px 9px;letter-spacing:.06em}
+  .clock b{color:var(--amber);font-weight:700}
+  .run-ctl{display:flex;gap:6px;margin-left:auto;align-items:center}
+  .run-ctl button{font-family:var(--sans);font-size:11px;letter-spacing:.02em;
     background:transparent;color:var(--dim);border:1px solid var(--line);
-    border-radius:6px;padding:6px 11px;cursor:pointer;transition:.12s}
-  .run-ctl button:hover{color:var(--hi);border-color:rgba(255,255,255,.25)}
-  .run-ctl button:disabled{opacity:.3;cursor:not-allowed}
-  .cluster{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;width:100%;margin-top:4px}
-  .gauge{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
-  .gauge .lbl{font-family:var(--sans);font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim)}
-  .gauge .val{font-family:var(--sans);font-size:22px;font-weight:600;margin-top:5px;line-height:1}
-  .gauge .delta{font-family:var(--sans);font-size:11px;margin-top:5px}
+    border-radius:6px;padding:5px 10px;cursor:pointer;transition:.12s}
+  .run-ctl button:hover{color:var(--hi);border-color:var(--amber)}
+  .run-ctl button:disabled{opacity:.35;cursor:not-allowed}
+  .drawer-toggle{background:var(--amber)!important;color:#fff!important;border-color:var(--amber)!important;font-weight:700}
+  /* compact stat chips inline in the top bar (was the big 4-gauge block) */
+  .cluster{display:flex;gap:8px;align-items:center;overflow:hidden}
+  .gauge{display:flex;align-items:baseline;gap:5px;background:var(--panel2);
+    border:1px solid var(--line);border-radius:7px;padding:4px 9px;white-space:nowrap}
+  .gauge .lbl{font-size:8.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim)}
+  .gauge .val{font-size:14px;font-weight:700;line-height:1}
+  .gauge .delta{font-size:10px}
+  .gauge.cash-danger .val{color:var(--red)}
+  @media(max-width:820px){ .cluster .gauge:nth-child(n+3){display:none} .brandmark .nm{font-size:15px} }
 
   /* ── layout ── */
-  @media(max-width:900px){.cluster{grid-template-columns:repeat(2,1fr)}}
   .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:18px}
   .panel h2{font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--dim);margin:0 0 14px;font-weight:600;font-family:var(--sans)}
 
@@ -2366,19 +2539,23 @@ return {
   .log .e b{color:var(--hi);font-weight:600}
   .log .e .q{color:var(--dimmer);margin-right:8px}
 
-  /* ── advance ── */
-  .advance{flex:0 0 auto;z-index:5}
-  .advisor-card{background:rgba(55,123,248,.07);border:1px solid rgba(55,123,248,.3);
-    border-radius:10px;padding:9px 13px;font-size:12px;font-family:var(--sans);
-    color:var(--fg);margin-bottom:8px;line-height:1.5}
+  /* ── advance — compact, floating bottom-centre over the map ── */
+  .advance{position:absolute;left:50%;bottom:64px;transform:translateX(-50%);z-index:7;
+    display:flex;flex-direction:column;align-items:center;gap:8px;
+    width:min(420px,calc(100vw - 40px));pointer-events:none}
+  .advance>*{pointer-events:auto}
+  .advisor-card{background:rgba(255,255,255,.92);backdrop-filter:blur(8px);
+    border:1px solid rgba(47,107,224,.35);border-radius:10px;padding:8px 13px;font-size:12px;
+    font-family:var(--sans);color:var(--fg);line-height:1.45;max-width:100%;
+    box-shadow:0 4px 16px rgba(30,40,52,.14)}
   .advisor-card::before{content:'▶  ';color:var(--amber);font-size:9px}
   .advisor-card.actionable{cursor:pointer;transition:background .15s,border-color .15s}
-  .advisor-card.actionable:hover{background:rgba(55,123,248,.14);border-color:rgba(55,123,248,.6)}
+  .advisor-card.actionable:hover{background:#fff;border-color:var(--amber)}
   .advisor-card.actionable::after{content:' →';color:var(--amber);font-size:10px;opacity:.7}
-  #advBtn{width:100%;font-family:var(--sans);font-weight:800;font-size:16px;
-    letter-spacing:.08em;text-transform:uppercase;color:#fff;background:var(--amber);
-    border:none;border-radius:12px;padding:16px;cursor:pointer;
-    box-shadow:0 6px 22px rgba(55,123,248,.28)}
+  #advBtn{font-family:var(--sans);font-weight:800;font-size:14px;
+    letter-spacing:.06em;text-transform:uppercase;color:#fff;background:var(--amber);
+    border:none;border-radius:11px;padding:13px 34px;cursor:pointer;
+    box-shadow:0 8px 24px rgba(47,107,224,.36)}
   #advBtn:hover{filter:brightness(1.06)} #advBtn:active{transform:translateY(1px)}
   .gameover{text-align:center;padding:24px;border:1px solid var(--red);border-radius:12px;background:rgba(229,96,94,.08)}
   .gameover h3{margin:0 0 6px;color:var(--red);letter-spacing:.05em}
@@ -2418,73 +2595,78 @@ return {
   .end-actions .primary-end{background:var(--amber);color:#fff;border-color:var(--amber);font-weight:700}
   .end-actions .primary-end:hover{filter:brightness(1.08);color:#fff}
 
-  /* ── world view — the single unified live surface ── */
-  /* ── main play layout: persistent world + dashboard side panel (Nav restructure) ── */
-  .app{display:flex;gap:14px;align-items:stretch;flex:1 1 auto;min-height:0}
-  .app-main{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:8px}
-  .app-side{flex:0 0 384px;display:flex;flex-direction:column;min-height:0}
-  .app-side .dashboard{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;margin-bottom:0}
+  /* ── map-first layout: the world fills the screen; dashboard is a right drawer ── */
+  .app{position:relative;flex:1 1 auto;min-height:0}
+  .app-main{position:absolute;inset:0}
+  /* Dashboard as a collapsible right drawer — it does NOT steal space until opened. */
+  .app-side{position:absolute;top:0;right:0;bottom:0;width:min(384px,92vw);z-index:50;
+    display:flex;flex-direction:column;background:var(--panel);
+    border-left:1px solid var(--line);box-shadow:-10px 0 34px rgba(30,40,52,.16);
+    transform:translateX(100%);transition:transform .26s cubic-bezier(.2,.8,.2,1)}
+  .app-side.open{transform:translateX(0)}
+  .drawer-head{display:flex;align-items:center;justify-content:space-between;
+    padding:11px 14px;border-bottom:1px solid var(--line);font-weight:700;font-size:13px;
+    letter-spacing:.04em}
+  .drawer-close{background:none;border:none;color:var(--dim);font-size:22px;line-height:1;
+    cursor:pointer;padding:0 4px}
+  .drawer-close:hover{color:var(--hi)}
+  .app-side #goalBanner{padding:10px 14px 0}
+  .app-side .dashboard{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;margin:0}
 
-  .world-view{position:relative;width:100%;flex:1 1 auto;min-height:240px;
-    border-radius:12px;overflow:hidden;background:#0C0F15;border:1px solid var(--line)}
-  .world-view.world-armed{border-color:rgba(55,123,248,.65)!important;
-    box-shadow:0 0 0 3px rgba(55,123,248,.18)}
+  .world-view{position:absolute;inset:0;overflow:hidden;background:#B9C7D3}
+  .world-view.world-armed{box-shadow:inset 0 0 0 3px rgba(47,107,224,.5)}
   #worldCanvas{position:absolute;inset:0;width:100%;height:100%;display:block}
-  .world-toolbar{position:absolute;bottom:0;left:0;right:0;
-    background:rgba(21,23,28,.86);backdrop-filter:blur(6px);
-    padding:9px 14px;border-top:1px solid var(--line);
-    display:flex;gap:8px;align-items:center;flex-wrap:wrap;z-index:3}
+  /* compact translucent build strip floating over the bottom of the map */
+  .world-toolbar{position:absolute;left:12px;right:12px;bottom:12px;
+    background:rgba(255,255,255,.82);backdrop-filter:blur(10px);
+    padding:8px 12px;border:1px solid rgba(30,40,52,.12);border-radius:12px;
+    box-shadow:0 6px 20px rgba(30,40,52,.14);
+    display:flex;gap:8px;align-items:center;flex-wrap:wrap;z-index:6}
 
-  /* ── live broadcast ticker (Task 3) ── */
-  .ticker-band{position:absolute;top:0;left:0;right:0;height:26px;z-index:5;pointer-events:none;
-    background:linear-gradient(90deg,rgba(12,14,20,.96),rgba(18,22,32,.93));
-    border-bottom:1px solid rgba(55,123,248,.25);overflow:hidden;
+  /* ── Market info (ticker / standings / valuation) — now lives in the drawer, not on
+     the map. Restyled from dark map-overlays to clean light cards. ── */
+  .market-layer{display:flex;flex-direction:column;gap:12px;margin-bottom:14px}
+  .ticker-band{height:26px;border:1px solid var(--line);border-radius:8px;overflow:hidden;
     display:flex;align-items:center;font-family:var(--sans);font-size:11px;white-space:nowrap;
-    -webkit-mask-image:linear-gradient(90deg,transparent,#000 4%,#000 97%,transparent);
-    mask-image:linear-gradient(90deg,transparent,#000 4%,#000 97%,transparent)}
+    background:var(--panel2);position:relative;
+    -webkit-mask-image:linear-gradient(90deg,transparent,#000 6%,#000 94%,transparent);
+    mask-image:linear-gradient(90deg,transparent,#000 6%,#000 94%,transparent)}
   .ticker-band::before{content:'● LIVE';position:absolute;left:0;top:0;bottom:0;z-index:2;
-    display:flex;align-items:center;padding:0 9px;color:#E5605E;font-weight:700;font-size:9px;
-    letter-spacing:.1em;background:rgba(10,12,18,.99);border-right:1px solid rgba(55,123,248,.3)}
+    display:flex;align-items:center;padding:0 9px;color:var(--red);font-weight:700;font-size:9px;
+    letter-spacing:.1em;background:var(--panel);border-right:1px solid var(--line)}
   .ticker-track{display:inline-flex;align-items:center;will-change:transform;padding-left:62px}
   .tk-item{display:inline-flex;align-items:center;gap:6px;padding:0 16px;
-    border-right:1px solid rgba(255,255,255,.07);color:var(--dim)}
+    border-right:1px solid var(--line);color:var(--dim)}
   .tk-k{color:var(--dimmer);letter-spacing:.05em;font-size:9px;text-transform:uppercase}
   .tk-v{color:var(--hi);font-weight:700}
   .tk-up{color:var(--green)} .tk-down{color:var(--red)} .tk-flat{color:var(--dim)}
   .tk-stock .tk-v{color:var(--amber)}
-  .tk-recall{color:#E5605E;font-weight:700;animation:tkBlink 1s steps(2,jump-none) infinite}
+  .tk-recall{color:var(--red);font-weight:700;animation:tkBlink 1s steps(2,jump-none) infinite}
   @keyframes tkBlink{50%{opacity:.35}}
 
-  /* ── rival scoreboard (Task 4) ── */
-  /* ── THE matchup: your car vs the field (world HUD centerpiece) ── */
-  .world-scoreboard{position:absolute;top:34px;right:10px;z-index:4;width:216px;
-    background:rgba(14,17,24,.92);backdrop-filter:blur(6px);
-    border:1px solid rgba(55,123,248,.35);border-radius:10px;padding:9px 11px;
-    font-family:var(--sans);pointer-events:none;box-shadow:0 6px 20px rgba(0,0,0,.45)}
+  /* standings: your car vs the field */
+  .world-scoreboard{background:var(--panel2);border:1px solid var(--line);border-radius:10px;
+    padding:11px 12px;font-family:var(--sans)}
   .mu-title{font-size:8.5px;letter-spacing:.12em;color:var(--amber);text-transform:uppercase;
-    margin-bottom:7px;font-weight:700}
+    margin-bottom:8px;font-weight:700}
   .mu-row{display:flex;align-items:center;gap:6px;padding:3px 0}
-  .mu-row.mu-you{background:rgba(55,123,248,.10);border-radius:5px;
-    margin:1px -4px;padding:3px 4px}
-  .mu-name{font-weight:700;font-size:10px;width:74px;flex-shrink:0;white-space:nowrap;
+  .mu-row.mu-you{background:rgba(47,107,224,.10);border-radius:5px;margin:1px -4px;padding:3px 4px}
+  .mu-name{font-weight:700;font-size:10px;width:80px;flex-shrink:0;white-space:nowrap;
     overflow:hidden;text-overflow:ellipsis}
   .mu-eng{font-size:8px;color:var(--dimmer);font-weight:400}
   .mu-crown{font-size:9px}
-  .mu-barwrap{flex:1 1 auto;height:7px;background:rgba(255,255,255,.06);border-radius:4px;overflow:hidden}
+  .mu-barwrap{flex:1 1 auto;height:7px;background:rgba(30,40,52,.08);border-radius:4px;overflow:hidden}
   .mu-bar{display:block;height:100%;border-radius:4px;transition:width .5s ease}
   .mu-pct{font-weight:700;font-size:11px;color:var(--hi);width:30px;text-align:right;flex-shrink:0}
-  .mu-foot{margin-top:7px;padding-top:6px;border-top:1px solid rgba(255,255,255,.08);
-    font-size:9.5px;text-align:center}
+  .mu-foot{margin-top:8px;padding-top:7px;border-top:1px solid var(--line);font-size:9.5px;text-align:center}
   .mu-win{color:var(--green);font-weight:700}
   .mu-chase{color:var(--dim)}
 
-  /* ── valuation readout + sparkline (Task 5) ── */
-  .world-valuation{position:absolute;top:34px;left:10px;z-index:4;
-    background:rgba(14,17,24,.84);backdrop-filter:blur(6px);
-    border:1px solid var(--line);border-radius:10px;padding:8px 11px;
-    font-family:var(--sans);pointer-events:none;min-width:132px}
+  /* valuation readout + sparkline */
+  .world-valuation{background:var(--panel2);border:1px solid var(--line);border-radius:10px;
+    padding:10px 12px;font-family:var(--sans)}
   .wv-k{font-size:8px;letter-spacing:.14em;color:var(--dimmer);text-transform:uppercase}
-  .wv-price{font-size:20px;font-weight:800;color:var(--amber);line-height:1.05;margin-top:2px}
+  .wv-price{font-size:22px;font-weight:800;color:var(--amber);line-height:1.05;margin-top:2px}
   .wv-trend{font-size:10px;font-weight:700;margin-left:5px;vertical-align:middle}
   .wv-sub{font-size:8.5px;color:var(--dimmer);margin-top:1px}
   .wv-spark{margin-top:5px;display:block}
@@ -2492,16 +2674,15 @@ return {
   /* ── world inspector popup + hover tooltip (fixed overlays) ── */
   /* Docked building inspector — anchors to the right edge of the world view so it
      never covers the board centre; always has a × and is dismissable three ways. */
-  .world-inspector{position:absolute;top:40px;right:8px;width:226px;
-    background:#1A1D24;border:1px solid var(--line);border-radius:11px;
-    padding:13px 14px;font-family:var(--sans);font-size:11px;z-index:9;pointer-events:auto;
-    box-shadow:0 8px 26px rgba(0,0,0,.6);overflow-y:auto;max-height:calc(100% - 150px)}
+  .world-inspector{position:absolute;top:14px;right:14px;width:238px;
+    background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:14px;font-family:var(--sans);font-size:11px;z-index:9;pointer-events:auto;
+    box-shadow:0 10px 30px rgba(30,40,52,.22);overflow-y:auto;max-height:calc(100% - 120px)}
   .winsp-close{position:absolute;top:6px;right:8px;background:none;border:none;
     color:var(--dim);font-size:20px;line-height:1;cursor:pointer;padding:2px 4px;z-index:2}
   .winsp-close:hover{color:var(--hi)}
-  /* while inspecting, hide the scoreboard (same corner) so panels don't overlap */
-  .world-view.inspecting .world-scoreboard{display:none!important}
-  .world-tooltip{position:fixed;background:#1A1D24;border:1px solid var(--line);
+  .world-tooltip{position:fixed;background:var(--panel);border:1px solid var(--line);
+    box-shadow:0 4px 14px rgba(30,40,52,.18);color:var(--hi);
     border-radius:6px;padding:5px 9px;font-family:var(--sans);font-size:10px;
     pointer-events:none;z-index:210;white-space:nowrap}
   @media(max-width:860px){
@@ -2510,14 +2691,16 @@ return {
   }
 
   /* ── campus builder UI (build toolbar + inspector) ── */
+  /* neutral build chips (blue stays a restrained accent, not the whole strip) */
   .wbuild-btn{font-family:var(--sans);font-size:12px;font-weight:600;
     display:inline-flex;align-items:center;gap:6px;
-    background:var(--amber);color:#fff;border:none;border-radius:8px;padding:8px 12px;
-    cursor:pointer;transition:.12s;white-space:nowrap}
-  .wbuild-btn.on{background:transparent;color:var(--amber);border:1px solid var(--amber)}
-  .wbuild-btn:hover{filter:brightness(1.05)}
-  .wbuild-btn:disabled{opacity:.35;cursor:not-allowed}
-  .wbuild-btn span{font-weight:400;font-size:11px}
+    background:var(--panel2);color:var(--hi);border:1px solid var(--line);border-radius:8px;
+    padding:7px 12px;cursor:pointer;transition:.12s;white-space:nowrap}
+  .wbuild-btn:hover{border-color:var(--amber);color:var(--amber)}
+  .wbuild-btn.on{background:var(--amber);color:#fff;border-color:var(--amber)}
+  .wbuild-btn:disabled{opacity:.4;cursor:not-allowed}
+  .wbuild-btn span{font-weight:500;font-size:11px;color:var(--dim)}
+  .wbuild-btn:hover span,.wbuild-btn.on span{color:inherit}
   .wbuild-more{font-family:var(--sans);font-size:11px;color:var(--dim);background:none;
     border:1px dashed var(--line);border-radius:8px;padding:8px 10px;cursor:pointer}
   .wbuild-more:hover{color:var(--hi);border-color:rgba(255,255,255,.3)}
@@ -2563,7 +2746,7 @@ return {
 
   /* ── floater feedback ── */
   .floater{position:fixed;left:50%;transform:translateX(-50%);
-    background:rgba(26,29,36,.95);border:1px solid var(--line);border-radius:20px;
+    background:rgba(255,255,255,.96);border:1px solid var(--line);border-radius:20px;box-shadow:0 4px 16px rgba(30,40,52,.16);
     padding:5px 14px;font-family:var(--sans);font-size:11px;font-weight:600;
     pointer-events:none;z-index:210;white-space:nowrap;
     animation:floatUp 2.2s ease forwards}
@@ -2575,8 +2758,8 @@ return {
   }
   /* inline confirm — non-blocking, docked bottom-centre (replaces confirm()) */
   .inline-confirm{position:fixed;left:50%;bottom:96px;transform:translateX(-50%);
-    background:#1A1D24;border:1px solid var(--amber);border-radius:12px;
-    padding:14px 16px;z-index:240;max-width:340px;box-shadow:0 8px 30px rgba(0,0,0,.6)}
+    background:var(--panel);border:1px solid var(--amber);border-radius:12px;
+    padding:14px 16px;z-index:240;max-width:340px;box-shadow:0 12px 34px rgba(30,40,52,.24)}
   .ic-msg{font-family:var(--sans);font-size:12px;color:var(--hi);line-height:1.5;margin-bottom:10px}
   .ic-actions{display:flex;gap:8px;justify-content:flex-end}
 
@@ -2594,7 +2777,7 @@ return {
      traps the board (map stays fully interactive). Rests collapsed; click expands +
      pins, the × or the auto-timeout (collapsed only) hides. */
   #reviewCard{position:fixed;top:74px;right:16px;
-    background:#1A1D24;border:1px solid var(--amber);border-radius:14px;
+    background:var(--panel);border:1px solid var(--amber);border-radius:14px;
     padding:18px 20px;width:300px;max-width:calc(100vw - 32px);z-index:220;
     font-family:var(--sans);box-shadow:0 8px 32px rgba(0,0,0,.55);cursor:pointer}
   .rv-x{position:absolute;top:8px;right:10px;background:none;border:none;color:var(--dim);
@@ -2641,35 +2824,14 @@ return {
   .dash-panel{padding:18px}
 
   /* ── mobile: dashboard becomes a collapsible bottom tray over a persistent world ── */
-  @media(max-width:860px){
-    body{padding:10px 10px 46px;height:auto;min-height:100dvh;display:block}
-    /* compress the header so the world + advance + tray fit one screen */
-    header{padding-bottom:8px;margin-bottom:8px;gap:8px}
-    .brandmark .sub{display:none}
-    .brandmark .nm{font-size:19px}
-    .cluster{grid-template-columns:repeat(4,1fr);gap:5px;margin-top:2px}
-    .gauge{padding:6px 7px;border-radius:8px}
-    .gauge .lbl{font-size:7px;letter-spacing:.06em}
-    .gauge .val{font-size:14px;margin-top:2px}
-    .gauge .delta{display:none}
-    .app{flex-direction:column;height:auto;min-height:0;gap:8px}
-    .app-main{gap:6px}
-    .world-view{height:calc(100dvh - 320px);min-height:180px;flex:none}
-    .advance{position:relative;z-index:5}
-    .app-side{position:fixed;left:0;right:0;bottom:0;z-index:60;flex:none;width:auto}
-    .app-side #goalBanner{display:none}
-    .app-side .dashboard{margin:0;background:var(--panel);border-top:1px solid var(--line);
-      box-shadow:0 -8px 26px rgba(0,0,0,.5);
-      transform:translateY(calc(100% - 42px));transition:transform .28s ease}
-    .app-side.tray-open .dashboard{transform:translateY(0)}
-    .dash-tabs{border-radius:0}
-    .tray-toggle{display:block}
-    .app-side.tray-open .tray-toggle{transform:rotate(180deg)}
-    .dash-body{max-height:56vh}
+  /* mobile: same right-drawer, near full-width; keep the top bar compact */
+  @media(max-width:820px){
+    .clock{display:none}
+    .run-ctl button{padding:5px 8px;font-size:10px}
   }
 
   /* ── launch screen ── */
-  #launchOverlay{position:fixed;inset:0;z-index:100;background:rgba(10,12,18,.94);
+  #launchOverlay{position:fixed;inset:0;z-index:100;background:rgba(35,45,58,.55);backdrop-filter:blur(3px);
     display:none;align-items:center;justify-content:center;padding:20px}
   .studio-actions{display:flex;flex-direction:column;gap:8px;margin-top:6px}
   .studio-actions .btn{align-self:flex-start}
@@ -2711,10 +2873,10 @@ return {
   #lnchAdvanced{margin-top:6px;border-top:1px solid var(--line);padding-top:12px}
 
   /* ── tutorial card ── */
-  #tutCard{position:fixed;bottom:80px;right:18px;z-index:50;
-    background:var(--panel);border:1px solid rgba(55,123,248,.4);border-radius:10px;
+  #tutCard{position:fixed;bottom:78px;left:18px;z-index:45;max-width:240px;
+    background:var(--panel);border:1px solid rgba(47,107,224,.4);border-radius:10px;
     padding:12px 14px;min-width:196px;font-family:var(--sans);font-size:10px;
-    box-shadow:0 4px 16px rgba(0,0,0,.4);transition:opacity .35s}
+    box-shadow:0 6px 20px rgba(30,40,52,.16);transition:opacity .35s}
   #tutCard.tut-fading{opacity:0;pointer-events:none}
   .tut-head{display:flex;justify-content:space-between;align-items:center;
     font-weight:600;letter-spacing:.1em;text-transform:uppercase;font-size:9px;
@@ -2748,43 +2910,38 @@ return {
 </head>
 <body>
 <header>
-  <div class="brandmark">
-    <div class="nm">Marque<span class="dot">.</span></div>
-    <div class="sub">Auto Company Sim · 1990–2010</div>
-  </div>
+  <div class="brandmark"><span class="nm">Marque<span class="dot">.</span></span></div>
   <div class="clock" id="clock">Q1 · 1990</div>
-  <div class="run-ctl">
-    <button id="newRunBtn">↻ New Run</button>
-    <button id="continueBtn">Continue Run</button>
-  </div>
   <div class="cluster" id="cluster"></div>
+  <div class="run-ctl">
+    <button id="newRunBtn">↻ New</button>
+    <button id="continueBtn">Continue</button>
+    <button id="drawerToggle" class="drawer-toggle" onclick="toggleDrawer()">☰ Dashboard</button>
+  </div>
 </header>
-<!-- main play area: world stays visible while the player works the dashboard -->
+<!-- map-first: the world fills the screen; the dashboard is a slide-in right drawer -->
 <div class="app">
   <div class="app-main">
-    <!-- unified world canvas — the primary build and watch surface -->
     <div class="world-view" id="worldView">
       <canvas id="worldCanvas"></canvas>
-      <!-- live broadcast ticker (Task 3) — rotates real sim-derived items, animates between quarters -->
-      <div class="ticker-band" id="tickerBand"><div class="ticker-track" id="tickerTrack"></div></div>
-      <!-- valuation readout + sparkline (Task 5) -->
-      <div class="world-valuation" id="worldValuation"></div>
-      <!-- rival scoreboard (Task 4) -->
-      <div class="world-scoreboard" id="worldScoreboard"></div>
-      <!-- docked building inspector — never floats over the map centre; always dismissable -->
+      <!-- docked building inspector — light card, top-right, always dismissable -->
       <div class="world-inspector" id="worldInspectorWrap" style="display:none">
         <button class="winsp-close" title="Close (Esc)" onclick="closeInspector()">×</button>
         <div id="worldInspector"></div>
       </div>
+      <!-- compact advance (+ advisor) floating over the map -->
+      <div class="advance">
+        <button id="advBtn">Advance Quarter ▸</button>
+      </div>
+      <!-- compact build strip over the bottom of the map -->
       <div class="world-toolbar" id="worldMenu"></div>
-    </div>
-    <div class="advance">
-      <button id="advBtn">Advance Quarter ▸</button>
     </div>
   </div>
 
-  <!-- dashboard: fixed side panel on desktop, collapsible bottom tray on mobile -->
+  <!-- dashboard drawer — hidden until opened; does not steal map space -->
   <aside class="app-side" id="appSide">
+    <div class="drawer-head"><span>Dashboard</span>
+      <button class="drawer-close" onclick="toggleDrawer()" aria-label="Close">×</button></div>
     <div id="goalBanner"></div>
     <div class="dashboard" id="dashboard">
       <div class="dash-tabs">
@@ -2792,7 +2949,6 @@ return {
         <button class="dash-tab" data-tab="rd" onclick="setDashTab('rd')">R&amp;D</button>
         <button class="dash-tab" data-tab="market" onclick="setDashTab('market')">Market</button>
         <button class="dash-tab" data-tab="log" onclick="setDashTab('log')">Log</button>
-        <button class="tray-toggle" id="trayToggle" onclick="toggleTray()" aria-label="Expand or collapse panel">▾</button>
       </div>
       <div class="dash-body">
         <div class="dash-panel" id="dashLineup">
@@ -2802,6 +2958,12 @@ return {
         </div>
         <div class="dash-panel" id="dashRD" style="display:none"><div id="rd"></div></div>
         <div class="dash-panel" id="dashMarket" style="display:none">
+          <!-- Market layer: standings + valuation + ticker (moved off the map) -->
+          <div class="market-layer">
+            <div class="world-scoreboard" id="worldScoreboard"></div>
+            <div class="world-valuation" id="worldValuation"></div>
+            <div class="ticker-band" id="tickerBand"><div class="ticker-track" id="tickerTrack"></div></div>
+          </div>
           <svg class="chart" id="chart" viewBox="0 0 320 150" preserveAspectRatio="none"></svg>
           <div class="leg" id="chartleg"></div>
           <div id="rivalCards" style="margin-top:16px;display:flex;flex-direction:column;gap:8px"></div>
@@ -3147,12 +3309,13 @@ function advisorAction(route){
   } else if(type === 'redesign' || type === 'design'){
     openStudio(param||null);
   } else if(type === 'seg'){
-    const card = document.querySelector(`.seg-card[data-seg="${param}"]`);
+    openDrawerTab('lineup');
+    const card = document.querySelector(`.seg[data-seg="${param}"]`);
     if(card) card.scrollIntoView({ behavior:'smooth', block:'center' });
   } else if(type === 'rd'){
-    setDashTab('rd');
-    const dt = document.getElementById('dashTabs');
-    if(dt) dt.scrollIntoView({ behavior:'smooth', block:'nearest' });
+    openDrawerTab('rd');            // tabs live in the drawer now — open it
+  } else if(type === 'market'){
+    openDrawerTab('market');
   }
 }
 function refreshRunButtons(){
@@ -3169,15 +3332,16 @@ function setDashTab(tab){
   const map={lineup:'dashLineup',rd:'dashRD',market:'dashMarket',log:'dashLog'};
   const target=document.getElementById(map[tab]||'dashLineup');
   if(target) target.style.display='block';
-  // on mobile, tapping a tab raises the bottom tray so its panel is visible
-  const side=document.getElementById('appSide');
-  if(side) side.classList.add('tray-open');
 }
-// collapse/expand the mobile dashboard tray (no-op affordance on desktop)
-function toggleTray(){
+// open/close the dashboard drawer (map-first: it's closed by default)
+function toggleDrawer(open){
   const side=document.getElementById('appSide');
-  if(side) side.classList.toggle('tray-open');
+  if(!side) return;
+  const willOpen = (open===undefined) ? !side.classList.contains('open') : !!open;
+  side.classList.toggle('open', willOpen);
 }
+// open the drawer AND switch to a specific tab (used by advisor routes / deep links)
+function openDrawerTab(tab){ if(tab) setDashTab(tab); toggleDrawer(true); }
 
 /* ── world inspector popup positioning ──────────────────────────────────── */
 function updateInspectorPopup(selId){
@@ -3221,7 +3385,7 @@ function deltaHtml(now, prev, money){
   return `<span class="${cls}">${ar} ${txt}</span>`;
 }
 function carSVG(hex){
-  return `<svg viewBox="0 0 40 20" fill="${hex}"><path d="M2 14 Q3 9 9 8 L13 4 Q15 2 20 2 L27 2 Q31 2 33 6 L37 8 Q39 9 38 13 L38 15 Q38 16 36 16 L4 16 Q2 16 2 14 Z"/><circle cx="11" cy="16" r="3" fill="#15171C"/><circle cx="30" cy="16" r="3" fill="#15171C"/></svg>`;
+  return `<svg viewBox="0 0 40 20" fill="${hex}"><path d="M2 14 Q3 9 9 8 L13 4 Q15 2 20 2 L27 2 Q31 2 33 6 L37 8 Q39 9 38 13 L38 15 Q38 16 36 16 L4 16 Q2 16 2 14 Z"/><circle cx="11" cy="16" r="3" fill="#2A3038"/><circle cx="30" cy="16" r="3" fill="#2A3038"/></svg>`;
 }
 function engHP(e){ return Math.round(120 + e.perf * 400); }
 function engFuel(e){
